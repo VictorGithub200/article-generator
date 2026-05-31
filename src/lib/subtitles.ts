@@ -587,7 +587,8 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
 export async function resolveTranscript(
   youtubeUrl: string,
   subtitleInput: string | undefined,
-  env: Env
+  env: Env,
+  subtitleFilename?: string
 ): Promise<TranscriptResult> {
   const videoId = extractVideoId(youtubeUrl);
   if (!videoId) {
@@ -610,8 +611,8 @@ export async function resolveTranscript(
     return {
       videoId,
       transcript: fallback,
-      source: "user_input",
-      detail: `YouTube 字幕抓取失败，已使用用户输入字幕。原因: ${toSafeErrorMessage(error)}`
+      source: subtitleFilename ? "user_file" : "user_input",
+      detail: `YouTube 字幕抓取失败，已使用${subtitleFilename ? `本地字幕文件 ${subtitleFilename}` : "用户输入字幕"}。原因: ${toSafeErrorMessage(error)}`
     };
   }
 }

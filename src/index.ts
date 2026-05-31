@@ -1,14 +1,33 @@
 import type { Env, GenerateRequest } from "./types";
 import { randomId, jsonResponse, toSafeErrorMessage, textEncoder } from "./lib/utils";
 import { resolveTranscript } from "./lib/subtitles";
-import { buildArticlePrompt } from "./prompts/article";
+import { buildArticleChunkPrompt } from "./prompts/article";
 import { buildFiveW1HPrompt, normalizeFiveW1H } from "./prompts/fivew1h";
 import { streamArticleHtml, generateFiveW1HJson } from "./lib/gemini";
 import { extractSections } from "./lib/sections";
+import { splitTranscript } from "./lib/transcript-chunks";
 import { ContextStoreDO, loadContext, saveContext } from "./context-store-do";
 
 function sseEvent(name: string, payload: unknown): string {
   return `event: ${name}\ndata: ${JSON.stringify(payload)}\n\n`;
+}
+
+function chunkIntervalMs(env: Env): number {
+  const parsed = Number.parseInt(env.GEMINI_CHUNK_INTERVAL_MS || "", 10);
+  if (!Number.isFinite(parsed)) return 6_500;
+  return Math.min(Math.max(parsed, 0), 15_000);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildContinuityContext(articleHtml: string): string {
+  return articleHtml
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(-1_500);
 }
 
 async function handleGenerate(request: Request, env: Env): Promise<Response> {
@@ -18,7 +37,17 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ error: "youtubeUrl 不能为空" }, 400);
   }
 
-  const transcriptResult = await resolveTranscript(body.youtubeUrl.trim(), body.subtitleInput, env);
+  const transcriptResult = await resolveTranscript(
+    body.youtubeUrl.trim(),
+    body.subtitleInput,
+    env,
+    body.subtitleFilename?.trim()
+  );
+  const transcriptChunks = splitTranscript(transcriptResult.transcript, env.TRANSCRIPT_CHUNK_CHARS);
+  if (!transcriptChunks.length) {
+    return jsonResponse({ error: "字幕内容为空或无法识别" }, 400);
+  }
+
   const contextId = randomId("ctx");
   const createdAt = new Date().toISOString();
 
@@ -36,23 +65,61 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
         createdAt,
         subtitleSource: transcriptResult.source,
         subtitleDetail: transcriptResult.detail,
-        videoId: transcriptResult.videoId
+        videoId: transcriptResult.videoId,
+        transcriptChars: transcriptChunks.join("\n").length,
+        chunkCount: transcriptChunks.length
       });
 
-      const prompt = buildArticlePrompt({
-        transcript: transcriptResult.transcript,
-        youtubeUrl: body.youtubeUrl,
-        guidance: body.guidance
-      });
+      let articleHtml = '<article class="dialogue-article">';
+      await writeEvent("chunk", { text: articleHtml });
 
-      const articleHtml = await streamArticleHtml({
-        prompt,
-        env,
-        onChunk: async (chunk) => {
-          await writeEvent("chunk", { text: chunk });
+      for (const [chunkIndex, transcriptChunk] of transcriptChunks.entries()) {
+        const intervalMs = chunkIndex ? chunkIntervalMs(env) : 0;
+        if (intervalMs) {
+          await writeEvent("progress", {
+            current: chunkIndex + 1,
+            total: transcriptChunks.length,
+            message: `等待 ${Math.ceil(intervalMs / 1_000)} 秒，以控制 Gemini 免费 API 请求速率`
+          });
+          await sleep(intervalMs);
         }
-      });
 
+        await writeEvent("progress", {
+          current: chunkIndex + 1,
+          total: transcriptChunks.length,
+          message: `正在生成第 ${chunkIndex + 1}/${transcriptChunks.length} 批字幕`
+        });
+
+        const prompt = buildArticleChunkPrompt({
+          transcript: transcriptChunk,
+          youtubeUrl: body.youtubeUrl,
+          guidance: body.guidance,
+          chunkIndex,
+          chunkCount: transcriptChunks.length,
+          continuityContext: buildContinuityContext(articleHtml)
+        });
+        const chunkHtml = await streamArticleHtml({
+          prompt,
+          env,
+          onChunk: async (chunk) => {
+            await writeEvent("chunk", { text: chunk });
+          },
+          onRetry: async (message) => {
+            await writeEvent("progress", {
+              current: chunkIndex + 1,
+              total: transcriptChunks.length,
+              message
+            });
+          }
+        });
+        if (!extractSections(chunkHtml).length) {
+          throw new Error(`第 ${chunkIndex + 1}/${transcriptChunks.length} 批字幕未生成可识别的章节结构，请重试`);
+        }
+        articleHtml += chunkHtml;
+      }
+
+      articleHtml += "</article>";
+      await writeEvent("chunk", { text: "</article>" });
       const sections = extractSections(articleHtml);
       if (!sections.length) {
         throw new Error("Gemini 已返回内容，但未生成可识别的章节结构，请重试");
@@ -64,7 +131,7 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
         youtubeUrl: body.youtubeUrl,
         videoId: transcriptResult.videoId,
         subtitleSource: transcriptResult.source,
-        transcript: transcriptResult.transcript,
+        transcript: transcriptChunks.join("\n"),
         articleHtml,
         sections
       });

@@ -1,15 +1,17 @@
 # article-generator
 
-一个部署在 Cloudflare Worker 的网页应用：输入 YouTube 链接（可附带字幕回退文本），基于 Gemini API 流式生成中文视频对话内容文章，并支持章节级 5W1H 总结。
+一个部署在 Cloudflare Worker 的网页应用：输入 YouTube 链接（可附带字幕回退文本或本地字幕文件），基于 Gemini API 流式生成中文视频对话稿文章，并支持章节级 5W1H 总结。
 
 ## 功能概览
 
 - YouTube 字幕策略：
   - 优先实时抓取 YouTube 字幕。
-  - 抓取失败时，自动回退到用户输入字幕（不是 demo 文本）。
+  - 抓取失败时，自动回退到本地 `.vtt`、`.srt`、`.txt` 文件或用户输入字幕（不是 demo 文本）。
 - 主文章生成：
   - 调用 Gemini `streamGenerateContent`。
   - 后端 SSE 流式转发，前端实时增量渲染 HTML。
+  - 清理字幕时间戳和连续重复 cue，再按字幕 cue 边界分块调用 Gemini，降低长字幕触发免费层配额限制的概率。
+  - 分块之间默认间隔 6.5 秒；遇到 Gemini `429` 时自动退避重试。
 - 可选生成要求：
   - 支持输入自然语言约束（任务类型、风格、受众、约束条件）。
   - 通过 prompt 注入影响生成内容边界。
@@ -22,6 +24,7 @@
 
 - `src/index.ts`：Worker 路由与 API 编排。
 - `src/lib/subtitles.ts`：YouTube 字幕抓取与回退。
+- `src/lib/transcript-chunks.ts`：字幕清理与按边界分块。
 - `src/lib/proxy-http.ts`：可选 Webshare 代理（Cloudflare TCP Socket 实现）。
 - `src/lib/gemini.ts`：Gemini 流式与普通 JSON 生成封装。
 - `src/context-store-do.ts`：Durable Object 上下文持久化。
@@ -40,6 +43,7 @@ npm run dev
 打开本地地址后输入：
 - YouTube 链接（必填）
 - 字幕回退文本（可选，但建议填，防止 YouTube 抓取失败）
+- 本地字幕文件（可选，选择后优先于回退文本）
 - 生成要求（可选）
 
 ## 部署
@@ -80,6 +84,7 @@ Webshare 免费节点仍可能被 YouTube 标记为 bot 流量。所有节点都
 
 - 用 Durable Object 存储“本次生成上下文”，满足 5W1H 不能由前端回传整文的约束。
 - 主生成使用 SSE 全链路流式，提高可感知速度。
+- 长字幕拆分为多个 Gemini 请求，兼顾免费层 TPM/RPM 限制与实时输出体验。
 - 将 YouTube 抓取、Gemini 调用、章节解析、上下文存储拆分为独立模块，降低耦合。
 - 代理能力做成可选开关：默认轻量可用，受限场景再启用。
 

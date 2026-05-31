@@ -3,10 +3,13 @@ const submitBtn = document.getElementById("submitBtn");
 const statusEl = document.getElementById("status");
 const metaEl = document.getElementById("meta");
 const articleOutput = document.getElementById("articleOutput");
+const subtitleFileInput = document.getElementById("subtitleFile");
+const subtitleFileMeta = document.getElementById("subtitleFileMeta");
 
 let currentContextId = "";
 let currentSections = [];
 let articleHtmlBuffer = "";
+const maxSubtitleFileBytes = 2 * 1024 * 1024;
 
 function setStatus(message, type = "") {
   statusEl.textContent = message;
@@ -100,6 +103,19 @@ function drainSseBlocks(buffer, flush = false) {
   return { blocks, rest };
 }
 
+async function readSubtitleFile() {
+  const file = subtitleFileInput.files?.[0];
+  if (!file) return { text: "", filename: "" };
+  if (file.size > maxSubtitleFileBytes) {
+    throw new Error("字幕文件不能超过 2 MB");
+  }
+
+  return {
+    text: await file.text(),
+    filename: file.name
+  };
+}
+
 async function streamGenerate(payload) {
   const response = await fetch("/api/generate", {
     method: "POST",
@@ -135,9 +151,21 @@ async function streamGenerate(payload) {
 
       if (event === "meta") {
         currentContextId = payloadObj.contextId || "";
-        const subtitleSourceLabel = payloadObj.subtitleSource === "youtube" ? "YouTube 实时字幕" : "用户输入字幕";
-        metaEl.textContent = `contextId: ${currentContextId} | 字幕来源: ${subtitleSourceLabel}`;
+        const subtitleSourceLabel =
+          payloadObj.subtitleSource === "youtube"
+            ? "YouTube 实时字幕"
+            : payloadObj.subtitleSource === "user_file"
+              ? "本地字幕文件"
+              : "用户输入字幕";
+        metaEl.textContent =
+          `contextId: ${currentContextId} | 字幕来源: ${subtitleSourceLabel}` +
+          ` | 字幕字符: ${payloadObj.transcriptChars || 0}` +
+          ` | 生成批次: ${payloadObj.chunkCount || 1}`;
         setStatus(payloadObj.subtitleDetail || "开始生成中...", "success");
+      }
+
+      if (event === "progress") {
+        setStatus(payloadObj.message || "正在分批生成...");
       }
 
       if (event === "chunk") {
@@ -175,6 +203,13 @@ async function streamGenerate(payload) {
   processBlocks(drainSseBlocks(buffer, true).blocks);
 }
 
+subtitleFileInput.addEventListener("change", () => {
+  const file = subtitleFileInput.files?.[0];
+  subtitleFileMeta.textContent = file
+    ? `${file.name} | ${(file.size / 1024).toFixed(1)} KB | 将优先使用文件内容`
+    : "支持 .vtt、.srt、.txt，选择文件后优先使用文件内容，最大 2 MB。";
+});
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
 
@@ -186,13 +221,14 @@ form.addEventListener("submit", async (event) => {
   articleHtmlBuffer = "";
   articleOutput.innerHTML = "";
 
-  const payload = {
-    youtubeUrl: document.getElementById("youtubeUrl").value.trim(),
-    subtitleInput: document.getElementById("subtitleInput").value.trim(),
-    guidance: document.getElementById("guidance").value.trim()
-  };
-
   try {
+    const subtitleFile = await readSubtitleFile();
+    const payload = {
+      youtubeUrl: document.getElementById("youtubeUrl").value.trim(),
+      subtitleInput: subtitleFile.text || document.getElementById("subtitleInput").value.trim(),
+      subtitleFilename: subtitleFile.filename,
+      guidance: document.getElementById("guidance").value.trim()
+    };
     await streamGenerate(payload);
   } catch (error) {
     setStatus(error.message || "生成失败", "error");

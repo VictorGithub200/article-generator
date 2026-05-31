@@ -1,8 +1,9 @@
-export type SubtitleSource = "youtube" | "user_input";
+export type SubtitleSource = "youtube" | "user_input" | "user_file";
 
 export interface GenerateRequest {
   youtubeUrl: string;
   subtitleInput?: string;
+  subtitleFilename?: string;
   guidance?: string;
 }
 
@@ -37,6 +38,8 @@ export interface Env {
   CONTEXT_STORE: DurableObjectNamespace;
   GEMINI_API_KEY: string;
   GEMINI_MODEL?: string;
+  GEMINI_CHUNK_INTERVAL_MS?: string;
+  TRANSCRIPT_CHUNK_CHARS?: string;
   YOUTUBE_FETCH_TIMEOUT_MS?: string;
   WEBSHARE_PROXY_ENABLED?: string;
   WEBSHARE_PROXY_HOST?: string;

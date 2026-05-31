@@ -70,21 +70,62 @@ function extractSseData(eventBlock: string): string {
     .trim();
 }
 
+function retryDelayMs(response: Response, body: string, attempt: number): number {
+  const retryAfter = Number.parseFloat(response.headers.get("retry-after") || "");
+  if (Number.isFinite(retryAfter)) {
+    return Math.min(Math.max(retryAfter * 1_000, 1_000), 15_000);
+  }
+
+  const bodyDelay = body.match(/"retryDelay"\s*:\s*"([\d.]+)s"/i);
+  if (bodyDelay) {
+    return Math.min(Math.max(Number.parseFloat(bodyDelay[1]) * 1_000, 1_000), 15_000);
+  }
+
+  return Math.min(2_000 * 2 ** attempt, 15_000);
+}
+
+async function fetchGeminiStream(
+  url: string,
+  body: string,
+  onRetry?: (message: string) => Promise<void> | void
+): Promise<Response> {
+  const maxAttempts = 3;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body
+    });
+
+    if (response.status !== 429 || attempt === maxAttempts - 1) {
+      return response;
+    }
+
+    const errorBody = await response.text().catch(() => "");
+    const delayMs = retryDelayMs(response, errorBody, attempt);
+    await onRetry?.(`Gemini 触发临时限流，等待 ${Math.ceil(delayMs / 1_000)} 秒后重试`);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  throw new Error("Gemini 流式请求重试失败");
+}
+
 export async function streamArticleHtml(params: {
   prompt: string;
   env: Env;
   onChunk: (chunk: string) => Promise<void> | void;
+  onRetry?: (message: string) => Promise<void> | void;
 }): Promise<string> {
   const key = requireApiKey(params.env);
   const model = modelName(params.env);
   const url = `${GEMINI_BASE}/models/${model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
+  const response = await fetchGeminiStream(
+    url,
+    JSON.stringify({
       generationConfig: {
         temperature: 0.6,
         topP: 0.9
@@ -95,8 +136,9 @@ export async function streamArticleHtml(params: {
           parts: [{ text: params.prompt }]
         }
       ]
-    })
-  });
+    }),
+    params.onRetry
+  );
 
   if (!response.ok || !response.body) {
     const text = await response.text().catch(() => "");
