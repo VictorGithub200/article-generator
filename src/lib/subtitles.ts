@@ -15,6 +15,12 @@ interface CaptionTrack {
   name?: { simpleText?: string };
 }
 
+interface LegacyTrack {
+  langCode: string;
+  name?: string;
+  kind?: string;
+}
+
 function decodeEscapedJsonString(input: string): string {
   return input
     .replace(/\\u0026/g, "&")
@@ -62,6 +68,25 @@ function extractBalancedJson(raw: string, startToken: string): string | null {
   return null;
 }
 
+function extractInitialPlayerResponse(watchHtml: string): any | null {
+  const candidates = [
+    "ytInitialPlayerResponse = ",
+    "var ytInitialPlayerResponse = ",
+    "window[\"ytInitialPlayerResponse\"] = "
+  ];
+
+  for (const token of candidates) {
+    const raw = extractBalancedJson(watchHtml, token);
+    if (!raw) continue;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // continue
+    }
+  }
+  return null;
+}
+
 function transcriptFromJson3(payload: any): string {
   const events = Array.isArray(payload?.events) ? payload.events : [];
   const lines: string[] = [];
@@ -106,6 +131,31 @@ function rankTracks(captionTracks: CaptionTrack[]): CaptionTrack[] {
   };
 
   return [...captionTracks].sort((a, b) => rank(a) - rank(b));
+}
+
+function rankLegacyTracks(tracks: LegacyTrack[]): LegacyTrack[] {
+  const preferred = ["zh-Hans", "zh-CN", "zh-TW", "zh-Hant", "zh", "en"];
+  const rank = (track: LegacyTrack) => {
+    const code = (track.langCode || "").toLowerCase();
+    const idx = preferred.findIndex((p) => p.toLowerCase() === code);
+    return idx >= 0 ? idx : 999;
+  };
+  return [...tracks].sort((a, b) => rank(a) - rank(b));
+}
+
+function parseLegacyTrackList(xml: string): LegacyTrack[] {
+  const matches = Array.from(xml.matchAll(/<track\s+([^>]+?)\s*\/?>/g));
+  const tracks: LegacyTrack[] = [];
+
+  for (const m of matches) {
+    const attrs = m[1] || "";
+    const langCode = attrs.match(/lang_code="([^"]+)"/)?.[1];
+    if (!langCode) continue;
+    const name = attrs.match(/name="([^"]*)"/)?.[1];
+    const kind = attrs.match(/kind="([^"]*)"/)?.[1];
+    tracks.push({ langCode, name, kind });
+  }
+  return tracks;
 }
 
 async function fetchTrackOnce(
@@ -210,18 +260,10 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
   }
 
   const watchHtml = await watchResp.text();
-  const captionsJsonRaw =
-    extractBalancedJson(watchHtml, '"captions":') ||
-    extractBalancedJson(watchHtml, '"captions": ');
-
-  if (!captionsJsonRaw) {
-    throw new Error("Cannot locate captions metadata, possible bot-check or no subtitles");
-  }
-
-  const captions = JSON.parse(captionsJsonRaw);
-  const captionTracks = captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  const playerResponse = extractInitialPlayerResponse(watchHtml);
+  const captionTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
   if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
-    throw new Error("No caption tracks found on video");
+    throw new Error("No caption tracks found on video (ytInitialPlayerResponse)");
   }
   const poToken = extractPoToken(watchHtml);
 
@@ -236,6 +278,35 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
     } catch (error) {
       errors.push(`lang=${track.languageCode || "unknown"}: ${toSafeErrorMessage(error)}`);
     }
+  }
+
+  try {
+    const legacyTrackListUrl = new URL("https://video.google.com/timedtext");
+    legacyTrackListUrl.searchParams.set("type", "list");
+    legacyTrackListUrl.searchParams.set("v", videoId);
+    const listResp = await fetchWithOptionalProxy(legacyTrackListUrl, env, timeoutMs, { proxySessionId });
+    if (listResp.ok) {
+      const xml = await listResp.text();
+      const legacyTracks = rankLegacyTracks(parseLegacyTrackList(xml));
+      for (const track of legacyTracks) {
+        const tUrl = new URL("https://video.google.com/timedtext");
+        tUrl.searchParams.set("v", videoId);
+        tUrl.searchParams.set("lang", track.langCode);
+        if (track.name) tUrl.searchParams.set("name", track.name);
+        if (track.kind) tUrl.searchParams.set("kind", track.kind);
+        tUrl.searchParams.set("fmt", "srv3");
+        try {
+          const legacy = await fetchTrackOnce(tUrl, env, timeoutMs, proxySessionId);
+          if (legacy.trim()) return legacy;
+        } catch (error) {
+          errors.push(`legacy-${track.langCode}: ${toSafeErrorMessage(error)}`);
+        }
+      }
+    } else {
+      errors.push(`legacy-list-http-${listResp.status}`);
+    }
+  } catch (error) {
+    errors.push(`legacy-list-error: ${toSafeErrorMessage(error)}`);
   }
 
   throw new Error(`All caption tracks failed. details=${errors.slice(0, 4).join(" | ")}`);
