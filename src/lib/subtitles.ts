@@ -101,7 +101,8 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
   const watchUrl = new URL(`https://www.youtube.com/watch?v=${videoId}`);
   const watchResp = await fetchWithOptionalProxy(watchUrl, env, timeoutMs);
   if (!watchResp.ok) {
-    throw new Error(`YouTube watch page fetch failed: ${watchResp.status}`);
+    const bodyPreview = (await watchResp.text()).slice(0, 200).replace(/\s+/g, " ");
+    throw new Error(`YouTube watch page fetch failed: ${watchResp.status}, body=${bodyPreview}`);
   }
 
   const watchHtml = await watchResp.text();
@@ -130,7 +131,8 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
 
   const captionResp = await fetchWithOptionalProxy(json3Url, env, timeoutMs);
   if (!captionResp.ok) {
-    throw new Error(`Caption track fetch failed: ${captionResp.status}`);
+    const bodyPreview = (await captionResp.text()).slice(0, 200).replace(/\s+/g, " ");
+    throw new Error(`Caption track fetch failed: ${captionResp.status}, body=${bodyPreview}`);
   }
 
   const contentType = captionResp.headers.get("content-type") || "";

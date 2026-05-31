@@ -3,7 +3,111 @@ import type { Env } from "../types";
 import { textDecoder, textEncoder } from "./utils";
 
 function isProxyEnabled(env: Env): boolean {
-  return env.WEBSHARE_PROXY_ENABLED === "true" && Boolean(env.WEBSHARE_PROXY_HOST);
+  const flag = (env.WEBSHARE_PROXY_ENABLED || "").trim().toLowerCase();
+  if (flag === "false" || flag === "0" || flag === "off") return false;
+  return Boolean((env.WEBSHARE_PROXY_HOST || "").trim());
+}
+
+function getProxyTarget(env: Env): { hostname: string; port: number } {
+  const rawHost = (env.WEBSHARE_PROXY_HOST || "").trim();
+  if (!rawHost) {
+    throw new Error("Proxy host missing");
+  }
+
+  let hostname = rawHost;
+  let port = Number.parseInt(env.WEBSHARE_PROXY_PORT || "80", 10);
+
+  if (rawHost.includes(":") && !rawHost.startsWith("[")) {
+    const [host, maybePort] = rawHost.split(":");
+    if (host && maybePort && /^\d+$/.test(maybePort)) {
+      hostname = host;
+      port = Number.parseInt(maybePort, 10);
+    }
+  }
+
+  return { hostname, port };
+}
+
+function proxyAuthHeader(env: Env): string {
+  if (!env.WEBSHARE_PROXY_USERNAME || !env.WEBSHARE_PROXY_PASSWORD) return "";
+  return `Proxy-Authorization: Basic ${btoa(`${env.WEBSHARE_PROXY_USERNAME}:${env.WEBSHARE_PROXY_PASSWORD}`)}\r\n`;
+}
+
+function mergeChunks(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, part) => sum + part.length, 0);
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const part of chunks) {
+    merged.set(part, offset);
+    offset += part.length;
+  }
+  return merged;
+}
+
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    chunks.push(value);
+  }
+
+  return mergeChunks(chunks);
+}
+
+function findHeaderEnd(buf: Uint8Array): number {
+  for (let i = 0; i <= buf.length - 4; i++) {
+    if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+async function readHead(stream: ReadableStream<Uint8Array>, timeoutMs: number): Promise<string> {
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+
+  const readPromise = (async () => {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      chunks.push(value);
+      const combined = mergeChunks(chunks);
+      const headerEnd = findHeaderEnd(combined);
+      if (headerEnd >= 0) {
+        const headBytes = combined.slice(0, headerEnd);
+        return textDecoder.decode(headBytes);
+      }
+    }
+
+    return textDecoder.decode(mergeChunks(chunks));
+  })();
+
+  try {
+    return await Promise.race([
+      readPromise,
+      new Promise<string>((_, reject) =>
+        setTimeout(() => reject(new Error(`Proxy head read timeout after ${timeoutMs}ms`)), timeoutMs)
+      )
+    ]);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function parseConnectStatus(head: string): { status: number; firstLine: string } {
+  const firstLine = head.split("\r\n")[0] || "";
+  const m = firstLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/);
+  return {
+    status: m ? Number.parseInt(m[1], 10) : 0,
+    firstLine
+  };
 }
 
 function maybeDecodeChunked(body: Uint8Array, headers: Headers): Uint8Array {
@@ -31,52 +135,11 @@ function maybeDecodeChunked(body: Uint8Array, headers: Headers): Uint8Array {
   }
 
   if (!out.length) return body;
-  const total = out.reduce((sum, part) => sum + part.length, 0);
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const part of out) {
-    merged.set(part, offset);
-    offset += part.length;
-  }
-  return merged;
-}
-
-async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    chunks.push(value);
-    total += value.length;
-  }
-
-  const merged = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return merged;
+  return mergeChunks(out);
 }
 
 function parseRawHttp(raw: Uint8Array): Response {
-  const marker = textEncoder.encode("\r\n\r\n");
-  let splitAt = -1;
-  for (let i = 0; i <= raw.length - marker.length; i++) {
-    if (
-      raw[i] === marker[0] &&
-      raw[i + 1] === marker[1] &&
-      raw[i + 2] === marker[2] &&
-      raw[i + 3] === marker[3]
-    ) {
-      splitAt = i;
-      break;
-    }
-  }
+  const splitAt = findHeaderEnd(raw);
   if (splitAt < 0) {
     return new Response("Invalid proxy response", { status: 502 });
   }
@@ -108,23 +171,14 @@ function parseRawHttp(raw: Uint8Array): Response {
   return new Response(bodyBuffer, { status, headers });
 }
 
-export async function fetchViaWebshareProxy(url: URL, env: Env, timeoutMs = 10000): Promise<Response> {
-  const host = env.WEBSHARE_PROXY_HOST;
-  if (!host) {
-    throw new Error("Proxy host missing");
-  }
-
-  const port = Number.parseInt(env.WEBSHARE_PROXY_PORT || "80", 10);
-  const socket = connect({ hostname: host, port });
-
-  const auth = env.WEBSHARE_PROXY_USERNAME && env.WEBSHARE_PROXY_PASSWORD
-    ? `Proxy-Authorization: Basic ${btoa(`${env.WEBSHARE_PROXY_USERNAME}:${env.WEBSHARE_PROXY_PASSWORD}`)}\r\n`
-    : "";
+async function fetchViaProxyHttp(url: URL, env: Env, timeoutMs: number): Promise<Response> {
+  const { hostname, port } = getProxyTarget(env);
+  const socket = connect({ hostname, port });
 
   const request =
     `GET ${url.toString()} HTTP/1.1\r\n` +
     `Host: ${url.host}\r\n` +
-    `${auth}` +
+    `${proxyAuthHeader(env)}` +
     "Accept: text/html,application/json,text/plain,*/*\r\n" +
     "User-Agent: Mozilla/5.0 (compatible; article-generator/1.0)\r\n" +
     "Connection: close\r\n\r\n";
@@ -144,22 +198,90 @@ export async function fetchViaWebshareProxy(url: URL, env: Env, timeoutMs = 1000
   return parseRawHttp(raw);
 }
 
+async function fetchViaProxyHttps(url: URL, env: Env, timeoutMs: number): Promise<Response> {
+  const { hostname, port } = getProxyTarget(env);
+  const socket = connect({ hostname, port }, { secureTransport: "starttls", allowHalfOpen: false });
+
+  const connectReq =
+    `CONNECT ${url.hostname}:${url.port || "443"} HTTP/1.1\r\n` +
+    `Host: ${url.hostname}:${url.port || "443"}\r\n` +
+    `${proxyAuthHeader(env)}` +
+    "Proxy-Connection: Keep-Alive\r\n\r\n";
+
+  const preWriter = socket.writable.getWriter();
+  await preWriter.write(textEncoder.encode(connectReq));
+  preWriter.releaseLock();
+
+  const head = await readHead(socket.readable, timeoutMs);
+  const { status, firstLine } = parseConnectStatus(head);
+  if (status !== 200) {
+    await socket.close();
+    throw new Error(`Proxy CONNECT failed: ${firstLine || "unknown"}`);
+  }
+
+  const tlsSocket = socket.startTls();
+  const requestPath = `${url.pathname}${url.search}`;
+  const req =
+    `GET ${requestPath || "/"} HTTP/1.1\r\n` +
+    `Host: ${url.host}\r\n` +
+    "Accept: text/html,application/json,text/plain,*/*\r\n" +
+    "User-Agent: Mozilla/5.0 (compatible; article-generator/1.0)\r\n" +
+    "Connection: close\r\n\r\n";
+
+  const writer = tlsSocket.writable.getWriter();
+  await writer.write(textEncoder.encode(req));
+  await writer.close();
+
+  const raw = await Promise.race([
+    readAll(tlsSocket.readable),
+    new Promise<Uint8Array>((_, reject) =>
+      setTimeout(() => reject(new Error(`Proxy HTTPS request timeout after ${timeoutMs}ms`)), timeoutMs)
+    )
+  ]);
+
+  await tlsSocket.close();
+  return parseRawHttp(raw);
+}
+
+export async function fetchViaWebshareProxy(url: URL, env: Env, timeoutMs = 10000): Promise<Response> {
+  if (url.protocol === "https:") {
+    return fetchViaProxyHttps(url, env, timeoutMs);
+  }
+  return fetchViaProxyHttp(url, env, timeoutMs);
+}
+
+function directFetch(url: URL): Promise<Response> {
+  return fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; article-generator/1.0)"
+    }
+  });
+}
+
 export async function fetchWithOptionalProxy(url: URL, env: Env, timeoutMs = 10000): Promise<Response> {
   if (!isProxyEnabled(env)) {
-    return fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; article-generator/1.0)"
-      }
-    });
+    return directFetch(url);
+  }
+
+  let directError: unknown = null;
+  let directResponse: Response | null = null;
+
+  try {
+    directResponse = await directFetch(url);
+    if (directResponse.ok) return directResponse;
+  } catch (error) {
+    directError = error;
   }
 
   try {
-    return await fetchViaWebshareProxy(url, env, timeoutMs);
+    const proxyResponse = await fetchViaWebshareProxy(url, env, timeoutMs);
+    if (proxyResponse.ok) return proxyResponse;
+
+    if (directResponse) return directResponse;
+    return proxyResponse;
   } catch {
-    return fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; article-generator/1.0)"
-      }
-    });
+    if (directResponse) return directResponse;
+    if (directError) throw directError;
+    return directFetch(url);
   }
 }

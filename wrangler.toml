@@ -17,5 +17,3 @@ new_sqlite_classes = ["ContextStoreDO"]
 [vars]
 GEMINI_MODEL = "gemini-2.5-flash"
 YOUTUBE_FETCH_TIMEOUT_MS = "12000"
-WEBSHARE_PROXY_ENABLED = "false"
-WEBSHARE_PROXY_PORT = "80"
