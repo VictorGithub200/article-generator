@@ -96,13 +96,18 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> 
   return mergeChunks(chunks);
 }
 
-function findHeaderEnd(buf: Uint8Array): number {
+function findHeaderEnd(buf: Uint8Array): { index: number; size: number } | null {
   for (let i = 0; i <= buf.length - 4; i++) {
     if (buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 && buf[i + 3] === 10) {
-      return i;
+      return { index: i, size: 4 };
     }
   }
-  return -1;
+  for (let i = 0; i <= buf.length - 2; i++) {
+    if (buf[i] === 10 && buf[i + 1] === 10) {
+      return { index: i, size: 2 };
+    }
+  }
+  return null;
 }
 
 async function readHead(stream: ReadableStream<Uint8Array>, timeoutMs: number): Promise<string> {
@@ -118,8 +123,8 @@ async function readHead(stream: ReadableStream<Uint8Array>, timeoutMs: number): 
       chunks.push(value);
       const combined = mergeChunks(chunks);
       const headerEnd = findHeaderEnd(combined);
-      if (headerEnd >= 0) {
-        const headBytes = combined.slice(0, headerEnd);
+      if (headerEnd) {
+        const headBytes = combined.slice(0, headerEnd.index);
         return textDecoder.decode(headBytes);
       }
     }
@@ -178,14 +183,15 @@ function maybeDecodeChunked(body: Uint8Array, headers: Headers): Uint8Array {
 
 function parseRawHttp(raw: Uint8Array): Response {
   const splitAt = findHeaderEnd(raw);
-  if (splitAt < 0) {
-    return new Response("Invalid proxy response", { status: 502 });
+  if (!splitAt) {
+    const preview = textDecoder.decode(raw.slice(0, Math.min(raw.length, 160))).replace(/\s+/g, " ");
+    return new Response(`Invalid proxy response: raw_len=${raw.length}, preview=${preview}`, { status: 502 });
   }
 
-  const headerBytes = raw.slice(0, splitAt);
-  const bodyBytes = raw.slice(splitAt + 4);
+  const headerBytes = raw.slice(0, splitAt.index);
+  const bodyBytes = raw.slice(splitAt.index + splitAt.size);
   const headerText = textDecoder.decode(headerBytes);
-  const lines = headerText.split("\r\n");
+  const lines = headerText.split(/\r?\n/);
   const statusLine = lines.shift() || "HTTP/1.1 502 Bad Gateway";
   const statusMatch = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/);
   const status = statusMatch ? Number.parseInt(statusMatch[1], 10) : 502;
@@ -217,6 +223,7 @@ async function fetchViaProxyHttp(
 ): Promise<Response> {
   const { hostname, port } = getProxyTarget(env);
   const socket = connect({ hostname, port });
+  await socket.opened;
 
   const headers = requestHeaders(url, options?.headers);
   const request =
@@ -247,6 +254,7 @@ async function fetchViaProxyHttps(
 ): Promise<Response> {
   const { hostname, port } = getProxyTarget(env);
   const socket = connect({ hostname, port }, { secureTransport: "starttls", allowHalfOpen: false });
+  await socket.opened;
 
   const connectReq =
     `CONNECT ${url.hostname}:${url.port || "443"} HTTP/1.1\r\n` +
@@ -266,6 +274,7 @@ async function fetchViaProxyHttps(
   }
 
   const tlsSocket = socket.startTls();
+  await tlsSocket.opened;
   const requestPath = `${url.pathname}${url.search}`;
   const headers = requestHeaders(url, options?.headers);
   const req =
@@ -287,6 +296,15 @@ async function fetchViaProxyHttps(
   return parseRawHttp(raw);
 }
 
+async function fetchViaProxyHttpsFallback(
+  url: URL,
+  env: Env,
+  timeoutMs: number,
+  options?: ProxyFetchOptions
+): Promise<Response> {
+  return fetchViaProxyHttp(url, env, timeoutMs, options);
+}
+
 export async function fetchViaWebshareProxy(
   url: URL,
   env: Env,
@@ -294,7 +312,11 @@ export async function fetchViaWebshareProxy(
   options?: ProxyFetchOptions
 ): Promise<Response> {
   if (url.protocol === "https:") {
-    return fetchViaProxyHttps(url, env, timeoutMs, options);
+    try {
+      return await fetchViaProxyHttps(url, env, timeoutMs, options);
+    } catch {
+      return fetchViaProxyHttpsFallback(url, env, timeoutMs, options);
+    }
   }
   return fetchViaProxyHttp(url, env, timeoutMs, options);
 }
