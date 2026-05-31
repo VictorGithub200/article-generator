@@ -32,19 +32,42 @@ function getProxyTarget(env: Env): { hostname: string; port: number } {
   return { hostname, port };
 }
 
-function proxyAuthHeader(env: Env, options?: ProxyFetchOptions): string {
-  if (!env.WEBSHARE_PROXY_USERNAME || !env.WEBSHARE_PROXY_PASSWORD) return "";
+function getProxyTargets(env: Env): Array<{ hostname: string; port: number }> {
+  const primary = getProxyTarget(env);
+  const targets: Array<{ hostname: string; port: number }> = [];
 
-  let username = env.WEBSHARE_PROXY_USERNAME;
-  const sessionId = options?.proxySessionId?.trim();
-  if (sessionId && !username.endsWith("-rotate")) {
-    const hasNumericSession = /-\d+$/.test(username);
-    if (!hasNumericSession) {
-      username = `${username}-${sessionId}`;
+  const rawList = (env.WEBSHARE_PROXY_ENDPOINTS || "").trim();
+  if (rawList) {
+    const items = rawList.split(/[,\n;]/).map((item) => item.trim()).filter(Boolean);
+    for (const item of items) {
+      const m = item.match(/^([^:\s]+):(\d{2,5})$/);
+      if (!m) continue;
+      targets.push({
+        hostname: m[1],
+        port: Number.parseInt(m[2], 10)
+      });
     }
   }
 
-  return `Proxy-Authorization: Basic ${btoa(`${username}:${env.WEBSHARE_PROXY_PASSWORD}`)}\r\n`;
+  if (!targets.some((item) => item.hostname === primary.hostname && item.port === primary.port)) {
+    targets.push(primary);
+  }
+
+  if (primary.hostname === "p.webshare.io") {
+    for (const alt of [80, 1080, 3128]) {
+      if (!targets.some((item) => item.port === alt)) {
+        targets.push({ hostname: primary.hostname, port: alt });
+      }
+    }
+  }
+
+  return targets;
+}
+
+function proxyAuthHeader(env: Env, options?: ProxyFetchOptions): string {
+  if (!env.WEBSHARE_PROXY_USERNAME || !env.WEBSHARE_PROXY_PASSWORD) return "";
+  // Use credentials exactly as configured by user.
+  return `Proxy-Authorization: Basic ${btoa(`${env.WEBSHARE_PROXY_USERNAME}:${env.WEBSHARE_PROXY_PASSWORD}`)}\r\n`;
 }
 
 function isProxyOnly(env: Env): boolean {
@@ -217,11 +240,12 @@ function parseRawHttp(raw: Uint8Array): Response {
 
 async function fetchViaProxyHttp(
   url: URL,
+  target: { hostname: string; port: number },
   env: Env,
   timeoutMs: number,
   options?: ProxyFetchOptions
 ): Promise<Response> {
-  const { hostname, port } = getProxyTarget(env);
+  const { hostname, port } = target;
   const socket = connect({ hostname, port });
   await socket.opened;
 
@@ -233,7 +257,7 @@ async function fetchViaProxyHttp(
 
   const writer = socket.writable.getWriter();
   await writer.write(textEncoder.encode(request));
-  await writer.close();
+  writer.releaseLock();
 
   const raw = await Promise.race([
     readAll(socket.readable),
@@ -248,11 +272,12 @@ async function fetchViaProxyHttp(
 
 async function fetchViaProxyHttps(
   url: URL,
+  target: { hostname: string; port: number },
   env: Env,
   timeoutMs: number,
   options?: ProxyFetchOptions
 ): Promise<Response> {
-  const { hostname, port } = getProxyTarget(env);
+  const { hostname, port } = target;
   const socket = connect({ hostname, port }, { secureTransport: "starttls", allowHalfOpen: false });
   await socket.opened;
 
@@ -283,7 +308,7 @@ async function fetchViaProxyHttps(
 
   const writer = tlsSocket.writable.getWriter();
   await writer.write(textEncoder.encode(req));
-  await writer.close();
+  writer.releaseLock();
 
   const raw = await Promise.race([
     readAll(tlsSocket.readable),
@@ -296,29 +321,27 @@ async function fetchViaProxyHttps(
   return parseRawHttp(raw);
 }
 
-async function fetchViaProxyHttpsFallback(
-  url: URL,
-  env: Env,
-  timeoutMs: number,
-  options?: ProxyFetchOptions
-): Promise<Response> {
-  return fetchViaProxyHttp(url, env, timeoutMs, options);
-}
-
 export async function fetchViaWebshareProxy(
   url: URL,
   env: Env,
   timeoutMs = 10000,
   options?: ProxyFetchOptions
 ): Promise<Response> {
-  if (url.protocol === "https:") {
+  const targets = getProxyTargets(env);
+  const errors: string[] = [];
+
+  for (const target of targets) {
     try {
-      return await fetchViaProxyHttps(url, env, timeoutMs, options);
-    } catch {
-      return fetchViaProxyHttpsFallback(url, env, timeoutMs, options);
+      if (url.protocol === "https:") {
+        return await fetchViaProxyHttps(url, target, env, timeoutMs, options);
+      }
+      return await fetchViaProxyHttp(url, target, env, timeoutMs, options);
+    } catch (error) {
+      errors.push(`${target.hostname}:${target.port} -> ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  return fetchViaProxyHttp(url, env, timeoutMs, options);
+
+  throw new Error(`All proxy targets failed: ${errors.join(" | ")}`);
 }
 
 function directFetch(url: URL, options?: ProxyFetchOptions): Promise<Response> {
