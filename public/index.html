@@ -220,7 +220,7 @@
     <main class="page">
       <section class="hero">
         <h1>Article Generator</h1>
-        <p class="sub">输入一个带字幕的 YouTube 链接，系统将实时抓取字幕并流式生成中文对话稿文章。若抓取失败，可回退到粘贴文本或本地字幕文件。长字幕会自动分块处理。</p>
+        <p class="sub">输入 YouTube 链接后，系统会实时抓取字幕并生成中文问答摘要稿。也可以直接上传本地字幕文件，跳过实时抓取。长字幕会自动分块处理。</p>
       </section>
 
       <section class="layout">
@@ -229,12 +229,9 @@
             <label for="youtubeUrl">YouTube 链接</label>
             <input id="youtubeUrl" name="youtubeUrl" required placeholder="https://www.youtube.com/watch?v=..." />
 
-            <label for="subtitleInput">字幕回退文本（可选）</label>
-            <textarea id="subtitleInput" name="subtitleInput" placeholder="当 YouTube 抓取失败时，将使用这里的字幕内容"></textarea>
-
             <label for="subtitleFile">本地字幕文件（可选）</label>
             <input id="subtitleFile" name="subtitleFile" type="file" accept=".vtt,.srt,.txt,text/plain,text/vtt,application/x-subrip" />
-            <p id="subtitleFileMeta" class="hint">支持 .vtt、.srt、.txt，选择文件后优先使用文件内容，最大 2 MB。</p>
+            <p id="subtitleFileMeta" class="hint">支持 .vtt、.srt、.txt，选择文件后跳过 YouTube 实时抓取，最大 2 MB。</p>
 
             <label for="guidance">生成要求（可选，自然语言）</label>
             <textarea id="guidance" name="guidance" placeholder="示例：任务类型=深度分析；输出风格=理性、结构化；目标受众=产品经理；约束=避免夸张结论"></textarea>

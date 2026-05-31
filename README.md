@@ -1,17 +1,19 @@
 # article-generator
 
-一个部署在 Cloudflare Worker 的网页应用：输入 YouTube 链接（可附带字幕回退文本或本地字幕文件），基于 Gemini API 流式生成中文视频对话稿文章，并支持章节级 5W1H 总结。
+一个部署在 Cloudflare Worker 的网页应用：输入 YouTube 链接（可附带本地字幕文件），基于 Gemini API 流式生成中文问答摘要稿文章，并支持章节级 5W1H 总结。
 
 ## 功能概览
 
 - YouTube 字幕策略：
-  - 优先实时抓取 YouTube 字幕。
-  - 抓取失败时，自动回退到本地 `.vtt`、`.srt`、`.txt` 文件或用户输入字幕（不是 demo 文本）。
+  - 没有上传字幕文件时，实时抓取 YouTube 字幕。
+  - 上传本地 `.vtt`、`.srt`、`.txt` 文件时，直接使用文件内容并跳过 YouTube 抓取。
+  - 实时抓取失败时，提示用户上传本地字幕文件。
 - 主文章生成：
   - 调用 Gemini `streamGenerateContent`。
   - 后端 SSE 流式转发，前端实时增量渲染 HTML。
   - 清理字幕时间戳和连续重复 cue，再按字幕 cue 边界分块调用 Gemini，降低长字幕触发免费层配额限制的概率。
   - 分块之间默认间隔 6.5 秒；遇到 Gemini `429` 时自动退避重试。
+  - 每章以主持人核心问题开头，再展示嘉宾的摘要回答，不逐句复述全部字幕。
 - 可选生成要求：
   - 支持输入自然语言约束（任务类型、风格、受众、约束条件）。
   - 通过 prompt 注入影响生成内容边界。
@@ -23,7 +25,7 @@
 ## 架构与工程拆分
 
 - `src/index.ts`：Worker 路由与 API 编排。
-- `src/lib/subtitles.ts`：YouTube 字幕抓取与回退。
+- `src/lib/subtitles.ts`：本地字幕优先与 YouTube 字幕抓取。
 - `src/lib/transcript-chunks.ts`：字幕清理与按边界分块。
 - `src/lib/proxy-http.ts`：可选 Webshare 代理（Cloudflare TCP Socket 实现）。
 - `src/lib/gemini.ts`：Gemini 流式与普通 JSON 生成封装。
@@ -42,8 +44,7 @@ npm run dev
 
 打开本地地址后输入：
 - YouTube 链接（必填）
-- 字幕回退文本（可选，但建议填，防止 YouTube 抓取失败）
-- 本地字幕文件（可选，选择后优先于回退文本）
+- 本地字幕文件（可选，选择后跳过 YouTube 抓取）
 - 生成要求（可选）
 
 ## 部署
@@ -78,7 +79,7 @@ npx wrangler secret put WEBSHARE_PROXY_ONLY
 TLS。配置多个节点后，系统会在 YouTube 返回 bot-check 时自动尝试下一个节点。
 
 Webshare 免费节点仍可能被 YouTube 标记为 bot 流量。所有节点都失败时，页面会提示用户
-替换代理节点或填写字幕回退文本。
+替换代理节点或上传本地字幕文件。
 
 ## 主要工程取舍
 
@@ -90,4 +91,4 @@ Webshare 免费节点仍可能被 YouTube 标记为 bot 流量。所有节点都
 
 ## 参考示例文件
 
-- `demo-dialog.txt`：你提供的演示文本（仅作为仓库参考，不作为默认回退字幕来源）。
+- `demo-dialog.txt`：你提供的演示文本（仅作为仓库参考，不作为字幕来源）。

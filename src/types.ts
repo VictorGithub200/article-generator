@@ -1,8 +1,8 @@
-export type SubtitleSource = "youtube" | "user_input" | "user_file";
+export type SubtitleSource = "youtube" | "user_file";
 
 export interface GenerateRequest {
   youtubeUrl: string;
-  subtitleInput?: string;
+  subtitleFileContent?: string;
   subtitleFilename?: string;
   guidance?: string;
 }

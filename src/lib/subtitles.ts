@@ -577,7 +577,7 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
   if (errors.length && errors.every((error) => error.includes("Sign in to confirm you’re not a bot"))) {
     throw new Error(
       `YouTube 已将全部 ${errors.length} 个 Webshare 代理节点识别为 bot 流量。` +
-      "请在 Webshare 替换代理节点，或在页面中填写字幕回退文本。"
+      "请在 Webshare 替换代理节点，或在页面中上传本地字幕文件。"
     );
   }
 
@@ -586,13 +586,23 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
 
 export async function resolveTranscript(
   youtubeUrl: string,
-  subtitleInput: string | undefined,
+  subtitleFileContent: string | undefined,
   env: Env,
   subtitleFilename?: string
 ): Promise<TranscriptResult> {
   const videoId = extractVideoId(youtubeUrl);
   if (!videoId) {
     throw new Error("无效的 YouTube 链接，未解析到 videoId");
+  }
+
+  const localTranscript = (subtitleFileContent || "").trim();
+  if (localTranscript) {
+    return {
+      videoId,
+      transcript: localTranscript,
+      source: "user_file",
+      detail: `已使用本地字幕文件${subtitleFilename ? ` ${subtitleFilename}` : ""}，跳过 YouTube 实时抓取`
+    };
   }
 
   try {
@@ -604,15 +614,6 @@ export async function resolveTranscript(
       detail: "实时抓取 YouTube 字幕成功"
     };
   } catch (error) {
-    const fallback = (subtitleInput || "").trim();
-    if (!fallback) {
-      throw new Error(`YouTube 字幕抓取失败，且未提供用户字幕。原因: ${toSafeErrorMessage(error)}`);
-    }
-    return {
-      videoId,
-      transcript: fallback,
-      source: subtitleFilename ? "user_file" : "user_input",
-      detail: `YouTube 字幕抓取失败，已使用${subtitleFilename ? `本地字幕文件 ${subtitleFilename}` : "用户输入字幕"}。原因: ${toSafeErrorMessage(error)}`
-    };
+    throw new Error(`YouTube 字幕抓取失败，请上传本地字幕文件后重试。原因: ${toSafeErrorMessage(error)}`);
   }
 }

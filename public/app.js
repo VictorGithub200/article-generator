@@ -154,9 +154,7 @@ async function streamGenerate(payload) {
         const subtitleSourceLabel =
           payloadObj.subtitleSource === "youtube"
             ? "YouTube 实时字幕"
-            : payloadObj.subtitleSource === "user_file"
-              ? "本地字幕文件"
-              : "用户输入字幕";
+            : "本地字幕文件";
         metaEl.textContent =
           `contextId: ${currentContextId} | 字幕来源: ${subtitleSourceLabel}` +
           ` | 字幕字符: ${payloadObj.transcriptChars || 0}` +
@@ -206,8 +204,8 @@ async function streamGenerate(payload) {
 subtitleFileInput.addEventListener("change", () => {
   const file = subtitleFileInput.files?.[0];
   subtitleFileMeta.textContent = file
-    ? `${file.name} | ${(file.size / 1024).toFixed(1)} KB | 将优先使用文件内容`
-    : "支持 .vtt、.srt、.txt，选择文件后优先使用文件内容，最大 2 MB。";
+    ? `${file.name} | ${(file.size / 1024).toFixed(1)} KB | 将跳过 YouTube 实时抓取`
+    : "支持 .vtt、.srt、.txt，选择文件后跳过 YouTube 实时抓取，最大 2 MB。";
 });
 
 form.addEventListener("submit", async (event) => {
@@ -225,7 +223,7 @@ form.addEventListener("submit", async (event) => {
     const subtitleFile = await readSubtitleFile();
     const payload = {
       youtubeUrl: document.getElementById("youtubeUrl").value.trim(),
-      subtitleInput: subtitleFile.text || document.getElementById("subtitleInput").value.trim(),
+      subtitleFileContent: subtitleFile.text,
       subtitleFilename: subtitleFile.filename,
       guidance: document.getElementById("guidance").value.trim()
     };

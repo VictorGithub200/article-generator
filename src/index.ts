@@ -39,7 +39,7 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
 
   const transcriptResult = await resolveTranscript(
     body.youtubeUrl.trim(),
-    body.subtitleInput,
+    body.subtitleFileContent,
     env,
     body.subtitleFilename?.trim()
   );
