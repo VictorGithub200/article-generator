@@ -1,0 +1,21 @@
+name = "article-generator"
+main = "src/index.ts"
+compatibility_date = "2026-05-31"
+
+[assets]
+directory = "public"
+binding = "ASSETS"
+
+[[durable_objects.bindings]]
+name = "CONTEXT_STORE"
+class_name = "ContextStoreDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ContextStoreDO"]
+
+[vars]
+GEMINI_MODEL = "gemini-2.5-flash"
+YOUTUBE_FETCH_TIMEOUT_MS = "12000"
+WEBSHARE_PROXY_ENABLED = "false"
+WEBSHARE_PROXY_PORT = "80"
