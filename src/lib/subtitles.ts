@@ -162,9 +162,10 @@ async function fetchTrackOnce(
   url: URL,
   env: Env,
   timeoutMs: number,
-  proxySessionId: string
+  proxySessionId: string,
+  headers: Record<string, string>
 ): Promise<string> {
-  const response = await fetchWithOptionalProxy(url, env, timeoutMs, { proxySessionId });
+  const response = await fetchWithOptionalProxy(url, env, timeoutMs, { proxySessionId, headers });
   if (!response.ok) {
     const bodyPreview = preview(await response.text());
     throw new Error(`Caption fetch failed: ${response.status}, body=${bodyPreview}`);
@@ -172,7 +173,9 @@ async function fetchTrackOnce(
 
   const raw = await response.text();
   if (!raw.trim()) {
-    throw new Error("Caption response empty");
+    const ct = response.headers.get("content-type") || "";
+    const cl = response.headers.get("content-length") || "";
+    throw new Error(`Caption response empty, status=${response.status}, ct=${ct}, cl=${cl}`);
   }
 
   const contentType = (response.headers.get("content-type") || "").toLowerCase();
@@ -210,8 +213,23 @@ function withPoToken(url: URL, poToken: string | null): URL {
   if (!copied.searchParams.get("pot")) {
     copied.searchParams.set("pot", poToken);
     copied.searchParams.set("potc", "1");
+    copied.searchParams.set("xorb", "2");
+    copied.searchParams.set("xobt", "3");
+    copied.searchParams.set("xovt", "3");
   }
   return copied;
+}
+
+function buildCookieHeaderFromSetCookie(setCookieRaw: string | null): string | null {
+  if (!setCookieRaw) return null;
+  const items = setCookieRaw
+    .split(/,(?=[^;,]+=)/)
+    .map((item) => item.trim())
+    .map((item) => item.split(";")[0]?.trim())
+    .filter(Boolean);
+
+  if (!items.length) return null;
+  return items.join("; ");
 }
 
 async function fetchTrackTranscript(
@@ -219,7 +237,8 @@ async function fetchTrackTranscript(
   env: Env,
   timeoutMs: number,
   poToken: string | null,
-  proxySessionId: string
+  proxySessionId: string,
+  headers: Record<string, string>
 ): Promise<string> {
   const decodedBase = decodeEscapedJsonString(track.baseUrl);
   const baseUrl = new URL(decodedBase);
@@ -239,7 +258,7 @@ async function fetchTrackTranscript(
   let lastError: unknown = null;
   for (const target of attempts) {
     try {
-      const transcript = await fetchTrackOnce(target, env, timeoutMs, proxySessionId);
+      const transcript = await fetchTrackOnce(target, env, timeoutMs, proxySessionId, headers);
       if (transcript.trim()) return transcript;
     } catch (error) {
       lastError = error;
@@ -250,13 +269,23 @@ async function fetchTrackTranscript(
 }
 
 async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promise<string> {
-  const timeoutMs = Number.parseInt(env.YOUTUBE_FETCH_TIMEOUT_MS || "12000", 10);
+  const rawTimeout = Number.parseInt(env.YOUTUBE_FETCH_TIMEOUT_MS || "12000", 10);
+  const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(10000, rawTimeout) : 12000;
   const proxySessionId = String(Math.floor(100000 + Math.random() * 900000));
   const watchUrl = new URL(`https://www.youtube.com/watch?v=${videoId}`);
   const watchResp = await fetchWithOptionalProxy(watchUrl, env, timeoutMs, { proxySessionId });
   if (!watchResp.ok) {
     const bodyPreview = preview(await watchResp.text(), 200);
     throw new Error(`YouTube watch page fetch failed: ${watchResp.status}, body=${bodyPreview}`);
+  }
+
+  const cookieHeader = buildCookieHeaderFromSetCookie(watchResp.headers.get("set-cookie"));
+  const requestHeaders: Record<string, string> = {
+    Referer: watchUrl.toString(),
+    Origin: "https://www.youtube.com"
+  };
+  if (cookieHeader) {
+    requestHeaders.Cookie = cookieHeader;
   }
 
   const watchHtml = await watchResp.text();
@@ -272,7 +301,14 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
 
   for (const track of ordered) {
     try {
-      const transcript = await fetchTrackTranscript(track, env, timeoutMs, poToken, proxySessionId);
+      const transcript = await fetchTrackTranscript(
+        track,
+        env,
+        timeoutMs,
+        poToken,
+        proxySessionId,
+        requestHeaders
+      );
       if (transcript.trim()) return transcript;
       errors.push(`lang=${track.languageCode || "unknown"}: empty transcript`);
     } catch (error) {
@@ -284,7 +320,10 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
     const legacyTrackListUrl = new URL("https://video.google.com/timedtext");
     legacyTrackListUrl.searchParams.set("type", "list");
     legacyTrackListUrl.searchParams.set("v", videoId);
-    const listResp = await fetchWithOptionalProxy(legacyTrackListUrl, env, timeoutMs, { proxySessionId });
+    const listResp = await fetchWithOptionalProxy(legacyTrackListUrl, env, timeoutMs, {
+      proxySessionId,
+      headers: requestHeaders
+    });
     if (listResp.ok) {
       const xml = await listResp.text();
       const legacyTracks = rankLegacyTracks(parseLegacyTrackList(xml));
@@ -296,7 +335,7 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
         if (track.kind) tUrl.searchParams.set("kind", track.kind);
         tUrl.searchParams.set("fmt", "srv3");
         try {
-          const legacy = await fetchTrackOnce(tUrl, env, timeoutMs, proxySessionId);
+          const legacy = await fetchTrackOnce(tUrl, env, timeoutMs, proxySessionId, requestHeaders);
           if (legacy.trim()) return legacy;
         } catch (error) {
           errors.push(`legacy-${track.langCode}: ${toSafeErrorMessage(error)}`);

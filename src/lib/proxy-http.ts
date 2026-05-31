@@ -3,6 +3,7 @@ import type { Env } from "../types";
 import { textDecoder, textEncoder } from "./utils";
 interface ProxyFetchOptions {
   proxySessionId?: string;
+  headers?: Record<string, string>;
 }
 
 function isProxyEnabled(env: Env): boolean {
@@ -44,6 +45,30 @@ function proxyAuthHeader(env: Env, options?: ProxyFetchOptions): string {
   }
 
   return `Proxy-Authorization: Basic ${btoa(`${username}:${env.WEBSHARE_PROXY_PASSWORD}`)}\r\n`;
+}
+
+function isProxyOnly(env: Env): boolean {
+  const flag = (env.WEBSHARE_PROXY_ONLY || "").trim().toLowerCase();
+  return flag === "true" || flag === "1" || flag === "on";
+}
+
+function requestHeaders(url: URL, headers?: Record<string, string>): Record<string, string> {
+  const merged: Record<string, string> = {
+    Host: url.host,
+    Accept: "text/html,application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (compatible; article-generator/1.0)",
+    Connection: "close",
+    ...headers
+  };
+  return merged;
+}
+
+function headersToRaw(headers: Record<string, string>): string {
+  return Object.entries(headers)
+    .filter(([, value]) => value != null && String(value).length > 0)
+    .map(([key, value]) => `${key}: ${value}`)
+    .join("\r\n");
 }
 
 function mergeChunks(chunks: Uint8Array[]): Uint8Array {
@@ -193,13 +218,11 @@ async function fetchViaProxyHttp(
   const { hostname, port } = getProxyTarget(env);
   const socket = connect({ hostname, port });
 
+  const headers = requestHeaders(url, options?.headers);
   const request =
     `GET ${url.toString()} HTTP/1.1\r\n` +
-    `Host: ${url.host}\r\n` +
     `${proxyAuthHeader(env, options)}` +
-    "Accept: text/html,application/json,text/plain,*/*\r\n" +
-    "User-Agent: Mozilla/5.0 (compatible; article-generator/1.0)\r\n" +
-    "Connection: close\r\n\r\n";
+    `${headersToRaw(headers)}\r\n\r\n`;
 
   const writer = socket.writable.getWriter();
   await writer.write(textEncoder.encode(request));
@@ -244,12 +267,10 @@ async function fetchViaProxyHttps(
 
   const tlsSocket = socket.startTls();
   const requestPath = `${url.pathname}${url.search}`;
+  const headers = requestHeaders(url, options?.headers);
   const req =
     `GET ${requestPath || "/"} HTTP/1.1\r\n` +
-    `Host: ${url.host}\r\n` +
-    "Accept: text/html,application/json,text/plain,*/*\r\n" +
-    "User-Agent: Mozilla/5.0 (compatible; article-generator/1.0)\r\n" +
-    "Connection: close\r\n\r\n";
+    `${headersToRaw(headers)}\r\n\r\n`;
 
   const writer = tlsSocket.writable.getWriter();
   await writer.write(textEncoder.encode(req));
@@ -278,11 +299,10 @@ export async function fetchViaWebshareProxy(
   return fetchViaProxyHttp(url, env, timeoutMs, options);
 }
 
-function directFetch(url: URL): Promise<Response> {
+function directFetch(url: URL, options?: ProxyFetchOptions): Promise<Response> {
+  const headers = requestHeaders(url, options?.headers);
   return fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; article-generator/1.0)"
-    }
+    headers
   });
 }
 
@@ -293,26 +313,37 @@ export async function fetchWithOptionalProxy(
   options?: ProxyFetchOptions
 ): Promise<Response> {
   if (!isProxyEnabled(env)) {
-    return directFetch(url);
+    return directFetch(url, options);
+  }
+
+  let proxyError: unknown = null;
+  let proxyResponse: Response | null = null;
+
+  try {
+    proxyResponse = await fetchViaWebshareProxy(url, env, timeoutMs, options);
+    if (proxyResponse.ok) return proxyResponse;
+  } catch (error) {
+    proxyError = error;
+  }
+
+  if (isProxyOnly(env)) {
+    if (proxyResponse) return proxyResponse;
+    if (proxyError) throw proxyError;
+    throw new Error("Proxy-only mode enabled, but proxy request failed");
   }
 
   let directError: unknown = null;
   let directResponse: Response | null = null;
-
   try {
-    directResponse = await directFetch(url);
+    directResponse = await directFetch(url, options);
     if (directResponse.ok) return directResponse;
   } catch (error) {
     directError = error;
   }
 
-  try {
-    const proxyResponse = await fetchViaWebshareProxy(url, env, timeoutMs, options);
-    if (proxyResponse.ok) return proxyResponse;
-    return proxyResponse;
-  } catch {
-    if (directResponse) return directResponse;
-    if (directError) throw directError;
-    return directFetch(url);
-  }
+  if (proxyResponse) return proxyResponse;
+  if (directResponse) return directResponse;
+  if (proxyError) throw proxyError;
+  if (directError) throw directError;
+  return directFetch(url, options);
 }

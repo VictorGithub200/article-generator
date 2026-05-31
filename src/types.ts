@@ -43,4 +43,5 @@ export interface Env {
   WEBSHARE_PROXY_PORT?: string;
   WEBSHARE_PROXY_USERNAME?: string;
   WEBSHARE_PROXY_PASSWORD?: string;
+  WEBSHARE_PROXY_ONLY?: string;
 }
