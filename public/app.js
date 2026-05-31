@@ -59,8 +59,8 @@ async function requestFiveW1H(sectionId, resultContainer, triggerBtn) {
 function attachSectionActions() {
   const sections = articleOutput.querySelectorAll("section");
   sections.forEach((section, index) => {
-    const h2 = section.querySelector("h2");
-    if (!h2) return;
+    const heading = section.querySelector("h3, h2");
+    if (!heading) return;
 
     const sectionMeta = currentSections[index];
     if (!sectionMeta) return;
@@ -78,7 +78,7 @@ function attachSectionActions() {
     const button = tools.querySelector("button");
     button.addEventListener("click", () => requestFiveW1H(sectionMeta.id, detail, button));
 
-    h2.appendChild(tools);
+    heading.appendChild(tools);
     section.appendChild(detail);
   });
 }

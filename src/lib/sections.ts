@@ -17,7 +17,9 @@ export function extractSections(articleHtml: string): SectionContext[] {
 
   while ((match = sectionRegex.exec(articleHtml))) {
     const sectionHtml = match[1] || "";
-    const titleMatch = sectionHtml.match(/<h2[^>]*>([\s\S]*?)<\/h2>/i);
+    const titleMatch =
+      sectionHtml.match(/<h3[^>]*>([\s\S]*?)<\/h3>/i) ||
+      sectionHtml.match(/<h2[^>]*>([\s\S]*?)<\/h2>/i);
     const title = titleMatch
       ? titleMatch[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
       : `章节 ${idx}`;
