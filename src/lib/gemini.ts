@@ -37,6 +37,39 @@ function sanitizeJsonText(raw: string): string {
   return raw.trim();
 }
 
+function drainSseBlocks(buffer: string, flush = false): {
+  blocks: string[];
+  rest: string;
+} {
+  const blocks: string[] = [];
+  const separator = /\r?\n\r?\n/g;
+  let start = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = separator.exec(buffer))) {
+    blocks.push(buffer.slice(start, match.index));
+    start = separator.lastIndex;
+  }
+
+  const rest = buffer.slice(start);
+  if (flush && rest.trim()) {
+    blocks.push(rest);
+    return { blocks, rest: "" };
+  }
+
+  return { blocks, rest };
+}
+
+function extractSseData(eventBlock: string): string {
+  return eventBlock
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n")
+    .trim();
+}
+
 export async function streamArticleHtml(params: {
   prompt: string;
   env: Env;
@@ -77,23 +110,9 @@ export async function streamArticleHtml(params: {
   let articleHtml = "";
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    buffer += value;
-
-    const events = buffer.split("\n\n");
-    buffer = events.pop() || "";
-
-    for (const eventBlock of events) {
-      const line = eventBlock
-        .split("\n")
-        .map((item) => item.trim())
-        .find((item) => item.startsWith("data:"));
-
-      if (!line) continue;
-      const data = line.slice(5).trim();
+  const processBlocks = async (blocks: string[]) => {
+    for (const eventBlock of blocks) {
+      const data = extractSseData(eventBlock);
       if (!data || data === "[DONE]") continue;
 
       try {
@@ -103,9 +122,26 @@ export async function streamArticleHtml(params: {
         articleHtml += chunk;
         await params.onChunk(chunk);
       } catch {
-        // skip malformed sse chunks
+        // Ignore malformed SSE events and continue consuming later chunks.
       }
     }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    buffer += value;
+
+    const drained = drainSseBlocks(buffer);
+    buffer = drained.rest;
+    await processBlocks(drained.blocks);
+  }
+
+  await processBlocks(drainSseBlocks(buffer, true).blocks);
+
+  if (!articleHtml.trim()) {
+    throw new Error("Gemini 已结束响应，但未返回文章内容，请重试");
   }
 
   return articleHtml;

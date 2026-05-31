@@ -80,6 +80,26 @@ function attachSectionActions() {
   });
 }
 
+function drainSseBlocks(buffer, flush = false) {
+  const blocks = [];
+  const separator = /\r?\n\r?\n/g;
+  let start = 0;
+  let match;
+
+  while ((match = separator.exec(buffer))) {
+    blocks.push(buffer.slice(start, match.index));
+    start = separator.lastIndex;
+  }
+
+  const rest = buffer.slice(start);
+  if (flush && rest.trim()) {
+    blocks.push(rest);
+    return { blocks, rest: "" };
+  }
+
+  return { blocks, rest };
+}
+
 async function streamGenerate(payload) {
   const response = await fetch("/api/generate", {
     method: "POST",
@@ -95,24 +115,20 @@ async function streamGenerate(payload) {
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!value) continue;
-    buffer += value;
-
-    const events = buffer.split("\n\n");
-    buffer = events.pop() || "";
-
-    for (const rawEvent of events) {
-      const lines = rawEvent.split("\n");
+  const processBlocks = (blocks) => {
+    for (const rawEvent of blocks) {
+      const lines = rawEvent.split(/\r?\n/);
       const event = lines.find((line) => line.startsWith("event:"))?.slice(6).trim();
-      const dataLine = lines.find((line) => line.startsWith("data:"));
-      if (!event || !dataLine) continue;
+      const data = lines
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n")
+        .trim();
+      if (!event || !data) continue;
 
       let payloadObj = {};
       try {
-        payloadObj = JSON.parse(dataLine.slice(5).trim());
+        payloadObj = JSON.parse(data);
       } catch {
         continue;
       }
@@ -130,6 +146,10 @@ async function streamGenerate(payload) {
       }
 
       if (event === "done") {
+        if (!articleHtmlBuffer.trim()) {
+          throw new Error("文章生成完成，但未收到正文内容，请重试");
+        }
+
         currentSections = Array.isArray(payloadObj.sections) ? payloadObj.sections : [];
         attachSectionActions();
         setStatus("文章生成完成，可点击各章节 5W1H。", "success");
@@ -139,7 +159,20 @@ async function streamGenerate(payload) {
         throw new Error(payloadObj.message || "流式生成失败");
       }
     }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    buffer += value;
+
+    const drained = drainSseBlocks(buffer);
+    buffer = drained.rest;
+    processBlocks(drained.blocks);
   }
+
+  processBlocks(drainSseBlocks(buffer, true).blocks);
 }
 
 form.addEventListener("submit", async (event) => {

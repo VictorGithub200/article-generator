@@ -54,6 +54,10 @@ async function handleGenerate(request: Request, env: Env): Promise<Response> {
       });
 
       const sections = extractSections(articleHtml);
+      if (!sections.length) {
+        throw new Error("Gemini 已返回内容，但未生成可识别的章节结构，请重试");
+      }
+
       await saveContext(env.CONTEXT_STORE, {
         contextId,
         createdAt,
