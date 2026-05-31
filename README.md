@@ -56,18 +56,25 @@ npm run deploy
 
 ```bash
 npx wrangler secret put WEBSHARE_PROXY_HOST
+npx wrangler secret put WEBSHARE_PROXY_PORT
 npx wrangler secret put WEBSHARE_PROXY_USERNAME
 npx wrangler secret put WEBSHARE_PROXY_PASSWORD
+npx wrangler secret put WEBSHARE_PROXY_ENDPOINTS
+npx wrangler secret put WEBSHARE_PROXY_ONLY
 ```
 
-并在 `wrangler.toml` 保持：
+`WEBSHARE_PROXY_ENDPOINTS` 可填写多个 Webshare Direct Connection 节点，以逗号分隔：
 
-```toml
-WEBSHARE_PROXY_ENABLED = "true"
-WEBSHARE_PROXY_PORT = "80"
+```text
+38.154.203.95:5863,198.105.121.200:6462
 ```
 
-说明：Worker 原生 `fetch` 不支持代理参数，因此通过 `cloudflare:sockets` 走 TCP 直连代理端点完成请求。
+说明：Worker 原生 `fetch` 不支持代理参数，因此通过 `cloudflare:sockets` 建立 TCP
+连接，将完整 HTTPS URL 以 HTTP absolute-form 发送给 Webshare，由代理处理目标站点
+TLS。配置多个节点后，系统会在 YouTube 返回 bot-check 时自动尝试下一个节点。
+
+Webshare 免费节点仍可能被 YouTube 标记为 bot 流量。所有节点都失败时，页面会提示用户
+替换代理节点或填写字幕回退文本。
 
 ## 主要工程取舍
 

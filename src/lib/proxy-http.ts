@@ -1,9 +1,17 @@
 import { connect } from "cloudflare:sockets";
 import type { Env } from "../types";
 import { textDecoder, textEncoder } from "./utils";
+export interface ProxyTarget {
+  hostname: string;
+  port: number;
+}
+
 interface ProxyFetchOptions {
   proxySessionId?: string;
   headers?: Record<string, string>;
+  method?: "GET" | "POST";
+  body?: string;
+  proxyTarget?: ProxyTarget;
 }
 
 function isProxyEnabled(env: Env): boolean {
@@ -12,7 +20,7 @@ function isProxyEnabled(env: Env): boolean {
   return Boolean((env.WEBSHARE_PROXY_HOST || "").trim());
 }
 
-function getProxyTarget(env: Env): { hostname: string; port: number } {
+function getProxyTarget(env: Env): ProxyTarget {
   const rawHost = (env.WEBSHARE_PROXY_HOST || "").trim();
   if (!rawHost) {
     throw new Error("Proxy host missing");
@@ -32,9 +40,8 @@ function getProxyTarget(env: Env): { hostname: string; port: number } {
   return { hostname, port };
 }
 
-function getProxyTargets(env: Env): Array<{ hostname: string; port: number }> {
-  const primary = getProxyTarget(env);
-  const targets: Array<{ hostname: string; port: number }> = [];
+export function listProxyTargets(env: Env): ProxyTarget[] {
+  const targets: ProxyTarget[] = [];
 
   const rawList = (env.WEBSHARE_PROXY_ENDPOINTS || "").trim();
   if (rawList) {
@@ -47,8 +54,13 @@ function getProxyTargets(env: Env): Array<{ hostname: string; port: number }> {
         port: Number.parseInt(m[2], 10)
       });
     }
+
+    if (targets.length) {
+      return targets;
+    }
   }
 
+  const primary = getProxyTarget(env);
   if (!targets.some((item) => item.hostname === primary.hostname && item.port === primary.port)) {
     targets.push(primary);
   }
@@ -79,6 +91,7 @@ function requestHeaders(url: URL, headers?: Record<string, string>): Record<stri
   const merged: Record<string, string> = {
     Host: url.host,
     Accept: "text/html,application/json,text/plain,*/*",
+    "Accept-Encoding": "identity",
     "Accept-Language": "en-US,en;q=0.9",
     "User-Agent": "Mozilla/5.0 (compatible; article-generator/1.0)",
     Connection: "close",
@@ -133,70 +146,32 @@ function findHeaderEnd(buf: Uint8Array): { index: number; size: number } | null 
   return null;
 }
 
-async function readHead(stream: ReadableStream<Uint8Array>, timeoutMs: number): Promise<string> {
-  const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
-
-  const readPromise = (async () => {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-
-      chunks.push(value);
-      const combined = mergeChunks(chunks);
-      const headerEnd = findHeaderEnd(combined);
-      if (headerEnd) {
-        const headBytes = combined.slice(0, headerEnd.index);
-        return textDecoder.decode(headBytes);
-      }
-    }
-
-    return textDecoder.decode(mergeChunks(chunks));
-  })();
-
-  try {
-    return await Promise.race([
-      readPromise,
-      new Promise<string>((_, reject) =>
-        setTimeout(() => reject(new Error(`Proxy head read timeout after ${timeoutMs}ms`)), timeoutMs)
-      )
-    ]);
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-function parseConnectStatus(head: string): { status: number; firstLine: string } {
-  const firstLine = head.split("\r\n")[0] || "";
-  const m = firstLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/);
-  return {
-    status: m ? Number.parseInt(m[1], 10) : 0,
-    firstLine
-  };
-}
-
 function maybeDecodeChunked(body: Uint8Array, headers: Headers): Uint8Array {
   const transferEncoding = headers.get("transfer-encoding")?.toLowerCase() || "";
   if (!transferEncoding.includes("chunked")) return body;
 
-  const text = textDecoder.decode(body);
   let cursor = 0;
   const out: Uint8Array[] = [];
 
-  while (cursor < text.length) {
-    const lineEnd = text.indexOf("\r\n", cursor);
+  while (cursor < body.length) {
+    let lineEnd = -1;
+    for (let i = cursor; i < body.length - 1; i++) {
+      if (body[i] === 13 && body[i + 1] === 10) {
+        lineEnd = i;
+        break;
+      }
+    }
     if (lineEnd < 0) break;
 
-    const sizeHex = text.slice(cursor, lineEnd).trim();
+    const sizeHex = textDecoder.decode(body.slice(cursor, lineEnd)).split(";")[0].trim();
     const size = Number.parseInt(sizeHex, 16);
     if (!Number.isFinite(size) || size < 0) break;
     cursor = lineEnd + 2;
 
     if (size === 0) break;
+    if (cursor + size > body.length) break;
 
-    const chunkText = text.slice(cursor, cursor + size);
-    out.push(textEncoder.encode(chunkText));
+    out.push(body.slice(cursor, cursor + size));
     cursor += size + 2;
   }
 
@@ -240,7 +215,7 @@ function parseRawHttp(raw: Uint8Array): Response {
 
 async function fetchViaProxyHttp(
   url: URL,
-  target: { hostname: string; port: number },
+  target: ProxyTarget,
   env: Env,
   timeoutMs: number,
   options?: ProxyFetchOptions
@@ -249,11 +224,17 @@ async function fetchViaProxyHttp(
   const socket = connect({ hostname, port });
   await socket.opened;
 
+  const method = options?.method || "GET";
+  const body = options?.body || "";
   const headers = requestHeaders(url, options?.headers);
+  if (body) {
+    headers["Content-Length"] = String(textEncoder.encode(body).length);
+  }
   const request =
-    `GET ${url.toString()} HTTP/1.1\r\n` +
+    `${method} ${url.toString()} HTTP/1.1\r\n` +
     `${proxyAuthHeader(env, options)}` +
-    `${headersToRaw(headers)}\r\n\r\n`;
+    `${headersToRaw(headers)}\r\n\r\n` +
+    body;
 
   const writer = socket.writable.getWriter();
   await writer.write(textEncoder.encode(request));
@@ -270,71 +251,17 @@ async function fetchViaProxyHttp(
   return parseRawHttp(raw);
 }
 
-async function fetchViaProxyHttps(
-  url: URL,
-  target: { hostname: string; port: number },
-  env: Env,
-  timeoutMs: number,
-  options?: ProxyFetchOptions
-): Promise<Response> {
-  const { hostname, port } = target;
-  const socket = connect({ hostname, port }, { secureTransport: "starttls", allowHalfOpen: false });
-  await socket.opened;
-
-  const connectReq =
-    `CONNECT ${url.hostname}:${url.port || "443"} HTTP/1.1\r\n` +
-    `Host: ${url.hostname}:${url.port || "443"}\r\n` +
-    `${proxyAuthHeader(env, options)}` +
-    "Proxy-Connection: Keep-Alive\r\n\r\n";
-
-  const preWriter = socket.writable.getWriter();
-  await preWriter.write(textEncoder.encode(connectReq));
-  preWriter.releaseLock();
-
-  const head = await readHead(socket.readable, timeoutMs);
-  const { status, firstLine } = parseConnectStatus(head);
-  if (status !== 200) {
-    await socket.close();
-    throw new Error(`Proxy CONNECT failed: ${firstLine || "unknown"}`);
-  }
-
-  const tlsSocket = socket.startTls();
-  await tlsSocket.opened;
-  const requestPath = `${url.pathname}${url.search}`;
-  const headers = requestHeaders(url, options?.headers);
-  const req =
-    `GET ${requestPath || "/"} HTTP/1.1\r\n` +
-    `${headersToRaw(headers)}\r\n\r\n`;
-
-  const writer = tlsSocket.writable.getWriter();
-  await writer.write(textEncoder.encode(req));
-  writer.releaseLock();
-
-  const raw = await Promise.race([
-    readAll(tlsSocket.readable),
-    new Promise<Uint8Array>((_, reject) =>
-      setTimeout(() => reject(new Error(`Proxy HTTPS request timeout after ${timeoutMs}ms`)), timeoutMs)
-    )
-  ]);
-
-  await tlsSocket.close();
-  return parseRawHttp(raw);
-}
-
 export async function fetchViaWebshareProxy(
   url: URL,
   env: Env,
   timeoutMs = 10000,
   options?: ProxyFetchOptions
 ): Promise<Response> {
-  const targets = getProxyTargets(env);
+  const targets = options?.proxyTarget ? [options.proxyTarget] : listProxyTargets(env);
   const errors: string[] = [];
 
   for (const target of targets) {
     try {
-      if (url.protocol === "https:") {
-        return await fetchViaProxyHttps(url, target, env, timeoutMs, options);
-      }
       return await fetchViaProxyHttp(url, target, env, timeoutMs, options);
     } catch (error) {
       errors.push(`${target.hostname}:${target.port} -> ${error instanceof Error ? error.message : String(error)}`);
@@ -346,8 +273,11 @@ export async function fetchViaWebshareProxy(
 
 function directFetch(url: URL, options?: ProxyFetchOptions): Promise<Response> {
   const headers = requestHeaders(url, options?.headers);
+  const method = options?.method || "GET";
   return fetch(url, {
-    headers
+    method,
+    headers,
+    body: method === "GET" ? undefined : options?.body
   });
 }
 

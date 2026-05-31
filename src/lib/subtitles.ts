@@ -1,6 +1,6 @@
 import type { Env, SubtitleSource } from "../types";
 import { extractVideoId, toSafeErrorMessage } from "./utils";
-import { fetchWithOptionalProxy } from "./proxy-http";
+import { fetchWithOptionalProxy, listProxyTargets, type ProxyTarget } from "./proxy-http";
 
 interface TranscriptResult {
   videoId: string;
@@ -87,6 +87,109 @@ function extractInitialPlayerResponse(watchHtml: string): any | null {
   return null;
 }
 
+function extractJsonString(watchHtml: string, key: string): string | null {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = watchHtml.match(new RegExp(`"${escapedKey}":"([^"]+)"`));
+  return match?.[1] ? decodeEscapedJsonString(match[1]) : null;
+}
+
+async function fetchInnertubePlayerResponse(
+  videoId: string,
+  watchHtml: string,
+  env: Env,
+  timeoutMs: number,
+  proxySessionId: string,
+  headers: Record<string, string>,
+  proxyTarget: ProxyTarget
+): Promise<any | null> {
+  const apiKey = extractJsonString(watchHtml, "INNERTUBE_API_KEY");
+  const clientVersion = extractJsonString(watchHtml, "INNERTUBE_CLIENT_VERSION");
+  if (!apiKey || !clientVersion) return null;
+
+  const visitorData = extractJsonString(watchHtml, "VISITOR_DATA");
+  const url = new URL("https://www.youtube.com/youtubei/v1/player");
+  url.searchParams.set("key", apiKey);
+
+  const clients: Array<Record<string, string | number>> = [
+    {
+      clientName: "ANDROID",
+      clientVersion: "20.10.38",
+      androidSdkVersion: 30,
+      hl: "en",
+      gl: "US",
+      userAgent: "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip",
+      osName: "Android",
+      osVersion: "14"
+    },
+    {
+      clientName: "WEB",
+      clientVersion,
+      hl: "en",
+      gl: "US",
+      ...(visitorData ? { visitorData } : {})
+    }
+  ];
+
+  let lastResponse: any | null = null;
+  const diagnostics: string[] = [];
+  for (const client of clients) {
+    const isAndroid = client.clientName === "ANDROID";
+    const response = await fetchWithOptionalProxy(url, env, timeoutMs, {
+      proxySessionId,
+      proxyTarget,
+      method: "POST",
+      body: JSON.stringify({
+        context: { client },
+        videoId,
+        contentCheckOk: true,
+        racyCheckOk: true
+      }),
+      headers: {
+        ...headers,
+        "Content-Type": "application/json",
+        "User-Agent": typeof client.userAgent === "string" ? client.userAgent : "Mozilla/5.0",
+        "X-YouTube-Client-Name": isAndroid ? "3" : "1",
+        "X-YouTube-Client-Version": String(client.clientVersion)
+      }
+    });
+    if (!response.ok) {
+      diagnostics.push(`${client.clientName}:http-${response.status}`);
+      continue;
+    }
+
+    const diagnosticResponse = response.clone();
+    try {
+      const payload: any = await response.json();
+      lastResponse = payload;
+      diagnostics.push(`${client.clientName}:${summarizePlayerResponse(payload)}`);
+      const tracks = payload?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      if (Array.isArray(tracks) && tracks.length) {
+        return payload;
+      }
+    } catch {
+      const raw = await diagnosticResponse.text();
+      diagnostics.push(
+        `${client.clientName}:invalid-json, ` +
+        `ce=${diagnosticResponse.headers.get("content-encoding") || ""}, ` +
+        `ct=${diagnosticResponse.headers.get("content-type") || ""}, ` +
+        `body=${preview(raw, 100)}`
+      );
+    }
+  }
+
+  return {
+    ...(lastResponse || {}),
+    _clientDiagnostics: diagnostics.join(" | ")
+  };
+}
+
+function summarizePlayerResponse(playerResponse: any): string {
+  const status = playerResponse?.playabilityStatus?.status || "missing";
+  const reason = playerResponse?.playabilityStatus?.reason || "";
+  const clients = playerResponse?._clientDiagnostics ? `, clients=${playerResponse._clientDiagnostics}` : "";
+  return `status=${status}, reason=${reason}${clients}`.slice(0, 360);
+}
+
 function transcriptFromJson3(payload: any): string {
   const events = Array.isArray(payload?.events) ? payload.events : [];
   const lines: string[] = [];
@@ -158,14 +261,84 @@ function parseLegacyTrackList(xml: string): LegacyTrack[] {
   return tracks;
 }
 
-async function fetchTrackOnce(
+async function fetchLegacyTrackListByUrl(
   url: URL,
   env: Env,
   timeoutMs: number,
   proxySessionId: string,
   headers: Record<string, string>
-): Promise<string> {
+): Promise<LegacyTrack[]> {
   const response = await fetchWithOptionalProxy(url, env, timeoutMs, { proxySessionId, headers });
+  if (!response.ok) return [];
+  const xml = await response.text();
+  if (!xml.trim()) return [];
+  return parseLegacyTrackList(xml);
+}
+
+async function fetchLegacyTranscriptNoTlsFirst(
+  videoId: string,
+  env: Env,
+  timeoutMs: number,
+  proxySessionId: string
+): Promise<string | null> {
+  const headers: Record<string, string> = {
+    Referer: `https://www.youtube.com/watch?v=${videoId}`,
+    Origin: "https://www.youtube.com"
+  };
+
+  const listUrls = [
+    new URL(`http://video.google.com/timedtext?type=list&v=${encodeURIComponent(videoId)}`),
+    new URL(`http://www.youtube.com/api/timedtext?type=list&v=${encodeURIComponent(videoId)}`)
+  ];
+
+  let legacyTracks: LegacyTrack[] = [];
+  for (const listUrl of listUrls) {
+    const found = await fetchLegacyTrackListByUrl(listUrl, env, timeoutMs, proxySessionId, headers);
+    if (found.length) {
+      legacyTracks = found;
+      break;
+    }
+  }
+
+  if (!legacyTracks.length) return null;
+
+  const ranked = rankLegacyTracks(legacyTracks);
+  const baseHosts = ["video.google.com", "www.youtube.com"];
+
+  for (const track of ranked) {
+    for (const host of baseHosts) {
+      const tUrl = new URL(`http://${host}/timedtext`);
+      if (host === "www.youtube.com") {
+        tUrl.pathname = "/api/timedtext";
+      }
+      tUrl.searchParams.set("v", videoId);
+      tUrl.searchParams.set("lang", track.langCode);
+      if (track.name) tUrl.searchParams.set("name", track.name);
+      if (track.kind) tUrl.searchParams.set("kind", track.kind);
+      tUrl.searchParams.set("fmt", "srv3");
+      tUrl.searchParams.set("track", "asr");
+
+      try {
+        const transcript = await fetchTrackOnce(tUrl, env, timeoutMs, proxySessionId, headers);
+        if (transcript.trim()) return transcript;
+      } catch {
+        // continue
+      }
+    }
+  }
+
+  return null;
+}
+
+async function fetchTrackOnce(
+  url: URL,
+  env: Env,
+  timeoutMs: number,
+  proxySessionId: string,
+  headers: Record<string, string>,
+  proxyTarget?: ProxyTarget
+): Promise<string> {
+  const response = await fetchWithOptionalProxy(url, env, timeoutMs, { proxySessionId, headers, proxyTarget });
   if (!response.ok) {
     const bodyPreview = preview(await response.text());
     throw new Error(`Caption fetch failed: ${response.status}, body=${bodyPreview}`);
@@ -238,7 +411,8 @@ async function fetchTrackTranscript(
   timeoutMs: number,
   poToken: string | null,
   proxySessionId: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  proxyTarget: ProxyTarget
 ): Promise<string> {
   const decodedBase = decodeEscapedJsonString(track.baseUrl);
   const baseUrl = new URL(decodedBase);
@@ -258,7 +432,7 @@ async function fetchTrackTranscript(
   let lastError: unknown = null;
   for (const target of attempts) {
     try {
-      const transcript = await fetchTrackOnce(target, env, timeoutMs, proxySessionId, headers);
+      const transcript = await fetchTrackOnce(target, env, timeoutMs, proxySessionId, headers, proxyTarget);
       if (transcript.trim()) return transcript;
     } catch (error) {
       lastError = error;
@@ -268,12 +442,15 @@ async function fetchTrackTranscript(
   throw lastError instanceof Error ? lastError : new Error("track transcript fetch failed");
 }
 
-async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promise<string> {
-  const rawTimeout = Number.parseInt(env.YOUTUBE_FETCH_TIMEOUT_MS || "12000", 10);
-  const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(10000, rawTimeout) : 12000;
-  const proxySessionId = String(Math.floor(100000 + Math.random() * 900000));
+async function fetchTranscriptFromWatch(
+  videoId: string,
+  env: Env,
+  timeoutMs: number,
+  proxySessionId: string,
+  proxyTarget: ProxyTarget
+): Promise<string> {
   const watchUrl = new URL(`https://www.youtube.com/watch?v=${videoId}`);
-  const watchResp = await fetchWithOptionalProxy(watchUrl, env, timeoutMs, { proxySessionId });
+  const watchResp = await fetchWithOptionalProxy(watchUrl, env, timeoutMs, { proxySessionId, proxyTarget });
   if (!watchResp.ok) {
     const bodyPreview = preview(await watchResp.text(), 200);
     throw new Error(`YouTube watch page fetch failed: ${watchResp.status}, body=${bodyPreview}`);
@@ -289,10 +466,34 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
   }
 
   const watchHtml = await watchResp.text();
-  const playerResponse = extractInitialPlayerResponse(watchHtml);
-  const captionTracks = playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  const embeddedPlayerResponse = extractInitialPlayerResponse(watchHtml);
+  const embeddedTracks = embeddedPlayerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  const playerResponse =
+    Array.isArray(embeddedTracks) && embeddedTracks.length
+      ? embeddedPlayerResponse
+      : await fetchInnertubePlayerResponse(
+      videoId,
+      watchHtml,
+      env,
+      timeoutMs,
+      proxySessionId,
+      requestHeaders,
+      proxyTarget
+      );
+  const fallbackCaptionsRaw =
+    extractBalancedJson(watchHtml, '"captions":') ||
+    extractBalancedJson(watchHtml, '"captions": ');
+  const fallbackCaptions = fallbackCaptionsRaw ? JSON.parse(fallbackCaptionsRaw) : null;
+  const captionTracks =
+    playerResponse?.captions?.playerCaptionsTracklistRenderer?.captionTracks ||
+    fallbackCaptions?.playerCaptionsTracklistRenderer?.captionTracks;
   if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
-    throw new Error("No caption tracks found on video (ytInitialPlayerResponse)");
+    throw new Error(
+      `No caption tracks found on video; ` +
+      `apiKey=${Boolean(extractJsonString(watchHtml, "INNERTUBE_API_KEY"))}, ` +
+      `clientVersion=${Boolean(extractJsonString(watchHtml, "INNERTUBE_CLIENT_VERSION"))}, ` +
+      `${summarizePlayerResponse(playerResponse)}; watch=${preview(watchHtml, 160)}`
+    );
   }
   const poToken = extractPoToken(watchHtml);
 
@@ -307,7 +508,8 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
         timeoutMs,
         poToken,
         proxySessionId,
-        requestHeaders
+        requestHeaders,
+        proxyTarget
       );
       if (transcript.trim()) return transcript;
       errors.push(`lang=${track.languageCode || "unknown"}: empty transcript`);
@@ -322,6 +524,7 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
     legacyTrackListUrl.searchParams.set("v", videoId);
     const listResp = await fetchWithOptionalProxy(legacyTrackListUrl, env, timeoutMs, {
       proxySessionId,
+      proxyTarget,
       headers: requestHeaders
     });
     if (listResp.ok) {
@@ -335,7 +538,7 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
         if (track.kind) tUrl.searchParams.set("kind", track.kind);
         tUrl.searchParams.set("fmt", "srv3");
         try {
-          const legacy = await fetchTrackOnce(tUrl, env, timeoutMs, proxySessionId, requestHeaders);
+          const legacy = await fetchTrackOnce(tUrl, env, timeoutMs, proxySessionId, requestHeaders, proxyTarget);
           if (legacy.trim()) return legacy;
         } catch (error) {
           errors.push(`legacy-${track.langCode}: ${toSafeErrorMessage(error)}`);
@@ -349,6 +552,36 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
   }
 
   throw new Error(`All caption tracks failed. details=${errors.slice(0, 4).join(" | ")}`);
+}
+
+async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promise<string> {
+  const rawTimeout = Number.parseInt(env.YOUTUBE_FETCH_TIMEOUT_MS || "12000", 10);
+  const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(10000, rawTimeout) : 12000;
+  const proxySessionId = String(Math.floor(100000 + Math.random() * 900000));
+
+  const noTlsTranscript = await fetchLegacyTranscriptNoTlsFirst(videoId, env, timeoutMs, proxySessionId);
+  if (noTlsTranscript?.trim()) {
+    return noTlsTranscript;
+  }
+
+  const targets = listProxyTargets(env);
+  const errors: string[] = [];
+  for (const target of targets) {
+    try {
+      return await fetchTranscriptFromWatch(videoId, env, timeoutMs, proxySessionId, target);
+    } catch (error) {
+      errors.push(`${target.hostname}:${target.port} -> ${toSafeErrorMessage(error)}`);
+    }
+  }
+
+  if (errors.length && errors.every((error) => error.includes("Sign in to confirm you’re not a bot"))) {
+    throw new Error(
+      `YouTube 已将全部 ${errors.length} 个 Webshare 代理节点识别为 bot 流量。` +
+      "请在 Webshare 替换代理节点，或在页面中填写字幕回退文本。"
+    );
+  }
+
+  throw new Error(`All YouTube proxy targets failed. details=${errors.join(" | ")}`);
 }
 
 export async function resolveTranscript(
