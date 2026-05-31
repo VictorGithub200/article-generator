@@ -1,6 +1,9 @@
 import { connect } from "cloudflare:sockets";
 import type { Env } from "../types";
 import { textDecoder, textEncoder } from "./utils";
+interface ProxyFetchOptions {
+  proxySessionId?: string;
+}
 
 function isProxyEnabled(env: Env): boolean {
   const flag = (env.WEBSHARE_PROXY_ENABLED || "").trim().toLowerCase();
@@ -28,9 +31,19 @@ function getProxyTarget(env: Env): { hostname: string; port: number } {
   return { hostname, port };
 }
 
-function proxyAuthHeader(env: Env): string {
+function proxyAuthHeader(env: Env, options?: ProxyFetchOptions): string {
   if (!env.WEBSHARE_PROXY_USERNAME || !env.WEBSHARE_PROXY_PASSWORD) return "";
-  return `Proxy-Authorization: Basic ${btoa(`${env.WEBSHARE_PROXY_USERNAME}:${env.WEBSHARE_PROXY_PASSWORD}`)}\r\n`;
+
+  let username = env.WEBSHARE_PROXY_USERNAME;
+  const sessionId = options?.proxySessionId?.trim();
+  if (sessionId && !username.endsWith("-rotate")) {
+    const hasNumericSession = /-\d+$/.test(username);
+    if (!hasNumericSession) {
+      username = `${username}-${sessionId}`;
+    }
+  }
+
+  return `Proxy-Authorization: Basic ${btoa(`${username}:${env.WEBSHARE_PROXY_PASSWORD}`)}\r\n`;
 }
 
 function mergeChunks(chunks: Uint8Array[]): Uint8Array {
@@ -171,14 +184,19 @@ function parseRawHttp(raw: Uint8Array): Response {
   return new Response(bodyBuffer, { status, headers });
 }
 
-async function fetchViaProxyHttp(url: URL, env: Env, timeoutMs: number): Promise<Response> {
+async function fetchViaProxyHttp(
+  url: URL,
+  env: Env,
+  timeoutMs: number,
+  options?: ProxyFetchOptions
+): Promise<Response> {
   const { hostname, port } = getProxyTarget(env);
   const socket = connect({ hostname, port });
 
   const request =
     `GET ${url.toString()} HTTP/1.1\r\n` +
     `Host: ${url.host}\r\n` +
-    `${proxyAuthHeader(env)}` +
+    `${proxyAuthHeader(env, options)}` +
     "Accept: text/html,application/json,text/plain,*/*\r\n" +
     "User-Agent: Mozilla/5.0 (compatible; article-generator/1.0)\r\n" +
     "Connection: close\r\n\r\n";
@@ -198,14 +216,19 @@ async function fetchViaProxyHttp(url: URL, env: Env, timeoutMs: number): Promise
   return parseRawHttp(raw);
 }
 
-async function fetchViaProxyHttps(url: URL, env: Env, timeoutMs: number): Promise<Response> {
+async function fetchViaProxyHttps(
+  url: URL,
+  env: Env,
+  timeoutMs: number,
+  options?: ProxyFetchOptions
+): Promise<Response> {
   const { hostname, port } = getProxyTarget(env);
   const socket = connect({ hostname, port }, { secureTransport: "starttls", allowHalfOpen: false });
 
   const connectReq =
     `CONNECT ${url.hostname}:${url.port || "443"} HTTP/1.1\r\n` +
     `Host: ${url.hostname}:${url.port || "443"}\r\n` +
-    `${proxyAuthHeader(env)}` +
+    `${proxyAuthHeader(env, options)}` +
     "Proxy-Connection: Keep-Alive\r\n\r\n";
 
   const preWriter = socket.writable.getWriter();
@@ -243,11 +266,16 @@ async function fetchViaProxyHttps(url: URL, env: Env, timeoutMs: number): Promis
   return parseRawHttp(raw);
 }
 
-export async function fetchViaWebshareProxy(url: URL, env: Env, timeoutMs = 10000): Promise<Response> {
+export async function fetchViaWebshareProxy(
+  url: URL,
+  env: Env,
+  timeoutMs = 10000,
+  options?: ProxyFetchOptions
+): Promise<Response> {
   if (url.protocol === "https:") {
-    return fetchViaProxyHttps(url, env, timeoutMs);
+    return fetchViaProxyHttps(url, env, timeoutMs, options);
   }
-  return fetchViaProxyHttp(url, env, timeoutMs);
+  return fetchViaProxyHttp(url, env, timeoutMs, options);
 }
 
 function directFetch(url: URL): Promise<Response> {
@@ -258,7 +286,12 @@ function directFetch(url: URL): Promise<Response> {
   });
 }
 
-export async function fetchWithOptionalProxy(url: URL, env: Env, timeoutMs = 10000): Promise<Response> {
+export async function fetchWithOptionalProxy(
+  url: URL,
+  env: Env,
+  timeoutMs = 10000,
+  options?: ProxyFetchOptions
+): Promise<Response> {
   if (!isProxyEnabled(env)) {
     return directFetch(url);
   }
@@ -274,10 +307,8 @@ export async function fetchWithOptionalProxy(url: URL, env: Env, timeoutMs = 100
   }
 
   try {
-    const proxyResponse = await fetchViaWebshareProxy(url, env, timeoutMs);
+    const proxyResponse = await fetchViaWebshareProxy(url, env, timeoutMs, options);
     if (proxyResponse.ok) return proxyResponse;
-
-    if (directResponse) return directResponse;
     return proxyResponse;
   } catch {
     if (directResponse) return directResponse;

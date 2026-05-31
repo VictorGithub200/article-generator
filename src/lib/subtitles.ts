@@ -9,6 +9,12 @@ interface TranscriptResult {
   detail: string;
 }
 
+interface CaptionTrack {
+  baseUrl: string;
+  languageCode?: string;
+  name?: { simpleText?: string };
+}
+
 function decodeEscapedJsonString(input: string): string {
   return input
     .replace(/\\u0026/g, "&")
@@ -56,15 +62,6 @@ function extractBalancedJson(raw: string, startToken: string): string | null {
   return null;
 }
 
-function pickTrack(captionTracks: Array<{ baseUrl: string; languageCode?: string; name?: { simpleText?: string } }>) {
-  const preferred = ["zh-Hans", "zh-CN", "zh-TW", "zh-Hant", "zh", "en"];
-  for (const lang of preferred) {
-    const track = captionTracks.find((item) => item.languageCode?.toLowerCase() === lang.toLowerCase());
-    if (track) return track;
-  }
-  return captionTracks[0];
-}
-
 function transcriptFromJson3(payload: any): string {
   const events = Array.isArray(payload?.events) ? payload.events : [];
   const lines: string[] = [];
@@ -96,12 +93,119 @@ function transcriptFromXml(xml: string): string {
   return lines.filter(Boolean).join("\n");
 }
 
+function preview(text: string, max = 160): string {
+  return text.replace(/\s+/g, " ").slice(0, max);
+}
+
+function rankTracks(captionTracks: CaptionTrack[]): CaptionTrack[] {
+  const preferred = ["zh-Hans", "zh-CN", "zh-TW", "zh-Hant", "zh", "en"];
+  const rank = (track: CaptionTrack) => {
+    const code = (track.languageCode || "").toLowerCase();
+    const idx = preferred.findIndex((p) => p.toLowerCase() === code);
+    return idx >= 0 ? idx : 999;
+  };
+
+  return [...captionTracks].sort((a, b) => rank(a) - rank(b));
+}
+
+async function fetchTrackOnce(
+  url: URL,
+  env: Env,
+  timeoutMs: number,
+  proxySessionId: string
+): Promise<string> {
+  const response = await fetchWithOptionalProxy(url, env, timeoutMs, { proxySessionId });
+  if (!response.ok) {
+    const bodyPreview = preview(await response.text());
+    throw new Error(`Caption fetch failed: ${response.status}, body=${bodyPreview}`);
+  }
+
+  const raw = await response.text();
+  if (!raw.trim()) {
+    throw new Error("Caption response empty");
+  }
+
+  const contentType = (response.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("application/json") || raw.trim().startsWith("{")) {
+    try {
+      const payload = JSON.parse(raw);
+      const transcript = transcriptFromJson3(payload);
+      if (!transcript) throw new Error("json3 events empty");
+      return transcript;
+    } catch (error) {
+      throw new Error(`Caption json parse failed: ${toSafeErrorMessage(error)}; raw=${preview(raw)}`);
+    }
+  }
+
+  const transcript = transcriptFromXml(raw);
+  if (!transcript) {
+    throw new Error(`Caption xml parsed but transcript empty; raw=${preview(raw)}`);
+  }
+  return transcript;
+}
+
+function extractPoToken(watchHtml: string): string | null {
+  const match = watchHtml.match(/"poToken":"([^"]+)"/);
+  if (!match?.[1]) return null;
+  try {
+    return decodeEscapedJsonString(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
+function withPoToken(url: URL, poToken: string | null): URL {
+  const copied = new URL(url.toString());
+  if (!poToken) return copied;
+  if (!copied.searchParams.get("pot")) {
+    copied.searchParams.set("pot", poToken);
+    copied.searchParams.set("potc", "1");
+  }
+  return copied;
+}
+
+async function fetchTrackTranscript(
+  track: CaptionTrack,
+  env: Env,
+  timeoutMs: number,
+  poToken: string | null,
+  proxySessionId: string
+): Promise<string> {
+  const decodedBase = decodeEscapedJsonString(track.baseUrl);
+  const baseUrl = new URL(decodedBase);
+
+  const attempts: URL[] = [];
+
+  const json3 = new URL(baseUrl.toString());
+  json3.searchParams.set("fmt", "json3");
+  attempts.push(withPoToken(json3, poToken));
+
+  attempts.push(withPoToken(baseUrl, poToken));
+
+  const xml = new URL(baseUrl.toString());
+  xml.searchParams.set("fmt", "srv3");
+  attempts.push(withPoToken(xml, poToken));
+
+  let lastError: unknown = null;
+  for (const target of attempts) {
+    try {
+      const transcript = await fetchTrackOnce(target, env, timeoutMs, proxySessionId);
+      if (transcript.trim()) return transcript;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("track transcript fetch failed");
+}
+
 async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promise<string> {
   const timeoutMs = Number.parseInt(env.YOUTUBE_FETCH_TIMEOUT_MS || "12000", 10);
+  const proxySessionId = String(Math.floor(100000 + Math.random() * 900000));
   const watchUrl = new URL(`https://www.youtube.com/watch?v=${videoId}`);
-  const watchResp = await fetchWithOptionalProxy(watchUrl, env, timeoutMs);
+  const watchResp = await fetchWithOptionalProxy(watchUrl, env, timeoutMs, { proxySessionId });
   if (!watchResp.ok) {
-    const bodyPreview = (await watchResp.text()).slice(0, 200).replace(/\s+/g, " ");
+    const bodyPreview = preview(await watchResp.text(), 200);
     throw new Error(`YouTube watch page fetch failed: ${watchResp.status}, body=${bodyPreview}`);
   }
 
@@ -119,41 +223,22 @@ async function fetchYoutubeTranscriptByVideoId(videoId: string, env: Env): Promi
   if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
     throw new Error("No caption tracks found on video");
   }
+  const poToken = extractPoToken(watchHtml);
 
-  const track = pickTrack(captionTracks);
-  if (!track?.baseUrl) {
-    throw new Error("No valid caption track baseUrl");
+  const ordered = rankTracks(captionTracks as CaptionTrack[]);
+  const errors: string[] = [];
+
+  for (const track of ordered) {
+    try {
+      const transcript = await fetchTrackTranscript(track, env, timeoutMs, poToken, proxySessionId);
+      if (transcript.trim()) return transcript;
+      errors.push(`lang=${track.languageCode || "unknown"}: empty transcript`);
+    } catch (error) {
+      errors.push(`lang=${track.languageCode || "unknown"}: ${toSafeErrorMessage(error)}`);
+    }
   }
 
-  const decodedBase = decodeEscapedJsonString(track.baseUrl);
-  const json3Url = new URL(decodedBase);
-  json3Url.searchParams.set("fmt", "json3");
-
-  const captionResp = await fetchWithOptionalProxy(json3Url, env, timeoutMs);
-  if (!captionResp.ok) {
-    const bodyPreview = (await captionResp.text()).slice(0, 200).replace(/\s+/g, " ");
-    throw new Error(`Caption track fetch failed: ${captionResp.status}, body=${bodyPreview}`);
-  }
-
-  const contentType = captionResp.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    const payload = await captionResp.json();
-    const transcript = transcriptFromJson3(payload);
-    if (!transcript) throw new Error("Caption json3 parsed but transcript empty");
-    return transcript;
-  }
-
-  const raw = await captionResp.text();
-  if (raw.trim().startsWith("{")) {
-    const payload = JSON.parse(raw);
-    const transcript = transcriptFromJson3(payload);
-    if (!transcript) throw new Error("Caption json parsed but transcript empty");
-    return transcript;
-  }
-
-  const transcript = transcriptFromXml(raw);
-  if (!transcript) throw new Error("Caption xml parsed but transcript empty");
-  return transcript;
+  throw new Error(`All caption tracks failed. details=${errors.slice(0, 4).join(" | ")}`);
 }
 
 export async function resolveTranscript(
